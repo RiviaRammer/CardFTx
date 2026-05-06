@@ -27,6 +27,7 @@ static constexpr int kMinScore = 10;
 static constexpr int kMaxCandidates = 140;
 static constexpr int kLdpcIterations = 25;
 static constexpr int kMaxDecodedMessages = 50;
+static constexpr int kCallsignHashTableSize = 256;
 static constexpr int kSpeakerChunkSamples = 512;
 static constexpr int kSpeakerChannel = 0;
 static constexpr uint32_t kDecodeTaskStackBytes = 16 * 1024;
@@ -54,7 +55,7 @@ static uint8_t micMagnification = 64;
 static struct {
     char callsign[12];
     uint32_t hash;
-} callsignHashtable[256];
+} callsignHashtable[kCallsignHashTableSize];
 
 static int callsignHashtableSize = 0;
 
@@ -84,20 +85,24 @@ static void hashtableCleanup(uint8_t maxAge)
 static void hashtableAdd(const char* callsign, uint32_t hash)
 {
     uint16_t hash10 = (hash >> 12) & 0x03ffu;
-    int idx = (hash10 * 23) % 256;
-    while (callsignHashtable[idx].callsign[0] != '\0') {
+    int idx = (hash10 * 23) % kCallsignHashTableSize;
+    for (int probe = 0; probe < kCallsignHashTableSize; ++probe) {
+        if (callsignHashtable[idx].callsign[0] == '\0') {
+            callsignHashtableSize++;
+            strncpy(callsignHashtable[idx].callsign, callsign, 11);
+            callsignHashtable[idx].callsign[11] = '\0';
+            callsignHashtable[idx].hash = hash;
+            return;
+        }
         if (((callsignHashtable[idx].hash & 0x3fffffu) == hash) &&
             strcmp(callsignHashtable[idx].callsign, callsign) == 0) {
             callsignHashtable[idx].hash &= 0x3fffffu;
             return;
         }
-        idx = (idx + 1) % 256;
+        idx = (idx + 1) % kCallsignHashTableSize;
     }
 
-    callsignHashtableSize++;
-    strncpy(callsignHashtable[idx].callsign, callsign, 11);
-    callsignHashtable[idx].callsign[11] = '\0';
-    callsignHashtable[idx].hash = hash;
+    Serial.println("Callsign hash table full");
 }
 
 static bool hashtableLookup(ftx_callsign_hash_type_t hashType, uint32_t hash, char* callsign)
@@ -105,14 +110,17 @@ static bool hashtableLookup(ftx_callsign_hash_type_t hashType, uint32_t hash, ch
     uint8_t hashShift = (hashType == FTX_CALLSIGN_HASH_10_BITS) ? 12 :
         (hashType == FTX_CALLSIGN_HASH_12_BITS ? 10 : 0);
     uint16_t hash10 = (hash >> (12 - hashShift)) & 0x03ffu;
-    int idx = (hash10 * 23) % 256;
+    int idx = (hash10 * 23) % kCallsignHashTableSize;
 
-    while (callsignHashtable[idx].callsign[0] != '\0') {
+    for (int probe = 0; probe < kCallsignHashTableSize; ++probe) {
+        if (callsignHashtable[idx].callsign[0] == '\0') {
+            break;
+        }
         if (((callsignHashtable[idx].hash & 0x3fffffu) >> hashShift) == hash) {
             strcpy(callsign, callsignHashtable[idx].callsign);
             return true;
         }
-        idx = (idx + 1) % 256;
+        idx = (idx + 1) % kCallsignHashTableSize;
     }
 
     callsign[0] = '\0';
@@ -392,15 +400,20 @@ static void decodeWaterfall(const monitor_t& monitor)
     for (int idx = 0; idx < numCandidates; ++idx) {
         const ftx_candidate_t* candidate = &candidateList[idx];
         ftx_message_t message;
-        ftx_decode_status_t status;
+        ftx_decode_status_t status = {};
         if (!ftx_decode_candidate(wf, candidate, kLdpcIterations, &message, &status)) {
             continue;
+        }
+
+        if (numDecoded >= kMaxDecodedMessages) {
+            Serial.println("RX decoded table full");
+            break;
         }
 
         int hashIndex = message.hash % kMaxDecodedMessages;
         bool foundEmpty = false;
         bool foundDuplicate = false;
-        do {
+        for (int probe = 0; probe < kMaxDecodedMessages && !foundEmpty && !foundDuplicate; ++probe) {
             if (decodedHashtable[hashIndex] == nullptr) {
                 foundEmpty = true;
             } else if ((decodedHashtable[hashIndex]->hash == message.hash) &&
@@ -409,7 +422,7 @@ static void decodeWaterfall(const monitor_t& monitor)
             } else {
                 hashIndex = (hashIndex + 1) % kMaxDecodedMessages;
             }
-        } while (!foundEmpty && !foundDuplicate);
+        }
 
         if (!foundEmpty) {
             continue;
