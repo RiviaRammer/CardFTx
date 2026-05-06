@@ -6,6 +6,7 @@
 #include <WiFi.h>
 #include <esp_heap_caps.h>
 #include <math.h>
+#include <string.h>
 #include <sys/time.h>
 #include <time.h>
 
@@ -32,11 +33,16 @@ static constexpr int kSpeakerChunkSamples = 512;
 static constexpr int kSpeakerChannel = 0;
 static constexpr uint32_t kDecodeTaskStackBytes = 16 * 1024;
 static constexpr int kFt8BlockSamples = static_cast<int>(kAudioSampleRate * FT8_SYMBOL_PERIOD);
+static constexpr bool kDrawRxWaterfall = true;
+static constexpr uint8_t kDisplayTextSize = 2;
+static constexpr uint8_t kDisplaySmallTextSize = 1;
+static constexpr int kDisplayLineHeight = 18;
+static constexpr int kCommandMaxLength = 63;
 static constexpr float kFt8SymbolBt = 2.0f;
 static constexpr float kGfskConstK = 5.336446f;
 
 static SemaphoreHandle_t radioMutex;
-static char txMessage[FTX_MAX_MESSAGE_LENGTH] = "CQ TEST AB12";
+static char txMessage[FTX_MAX_MESSAGE_LENGTH] = "CQ BG6WRI ON80";
 static float txToneHz = kFt8DefaultToneHz;
 static int16_t speakerBuffers[3][kSpeakerChunkSamples];
 static uint8_t speakerBufferIndex = 0;
@@ -44,13 +50,14 @@ static bool isTransmitting = false;
 static bool isReceiving = false;
 static uint32_t lastDisplayMs = 0;
 static uint32_t displayHoldUntilMs = 0;
+static String keyboardCommand;
 static int16_t rxPcm[kFt8BlockSamples];
 static float rxFrame[kFt8BlockSamples];
 static int32_t rxPeak = 0;
 static uint64_t rxAbsSum = 0;
 static uint32_t rxSampleTotal = 0;
-static bool micUseLeftChannel = true;
-static uint8_t micMagnification = 64;
+static char wifiSsid[33];
+static char wifiPassword[65];
 
 static struct {
     char callsign[12];
@@ -178,6 +185,26 @@ static int secondsToNextFt8Slot()
     return (15 - sec) % 15;
 }
 
+static void renderCommandLine()
+{
+    auto& display = M5Cardputer.Display;
+    int y = static_cast<int>(display.height()) - 17;
+    int maxChars = max(4, static_cast<int>(display.width()) / 12);
+    String text = ">";
+    text += keyboardCommand;
+    if (text.length() > static_cast<unsigned>(maxChars)) {
+        text = ">";
+        text += keyboardCommand.substring(keyboardCommand.length() - (maxChars - 1));
+    }
+
+    display.fillRect(0, y - 2, display.width(), display.height() - y + 2, TFT_BLACK);
+    display.drawFastHLine(4, y - 3, display.width() - 8, TFT_DARKGREY);
+    display.setTextSize(kDisplayTextSize);
+    display.setTextColor(TFT_WHITE, TFT_BLACK);
+    display.setCursor(4, y);
+    display.printf("%s", text.c_str());
+}
+
 static void renderStatus(bool force = false)
 {
     uint32_t nowMs = millis();
@@ -195,37 +222,176 @@ static void renderStatus(bool force = false)
     char utcText[16];
     formatUtcTime(utcText, sizeof(utcText));
     int waitSec = secondsToNextFt8Slot();
+    const char* statusText = isTransmitting ? "TX" : (isReceiving ? "RX" : "Idle");
+    int screenW = M5Cardputer.Display.width();
+    int statusX = screenW - static_cast<int>(strlen(statusText)) * 12 - 4;
 
     M5Cardputer.Display.fillScreen(TFT_BLACK);
     M5Cardputer.Display.setTextColor(TFT_GREEN, TFT_BLACK);
-    M5Cardputer.Display.setTextSize(1);
+    M5Cardputer.Display.setTextSize(kDisplayTextSize);
     M5Cardputer.Display.setCursor(4, 4);
-    M5Cardputer.Display.printf("CardFTx FT8\n");
+    M5Cardputer.Display.printf("FT8");
+    M5Cardputer.Display.setTextColor(isTransmitting ? TFT_ORANGE : (isReceiving ? TFT_CYAN : TFT_WHITE), TFT_BLACK);
+    M5Cardputer.Display.setCursor(max(52, statusX), 4);
+    M5Cardputer.Display.printf("%s", statusText);
+    M5Cardputer.Display.drawFastHLine(4, 23, screenW - 8, TFT_DARKGREY);
     M5Cardputer.Display.setTextColor(TFT_WHITE, TFT_BLACK);
-    M5Cardputer.Display.printf("UTC: %s\n", utcText);
-    M5Cardputer.Display.printf("WiFi: %s\n", WiFi.status() == WL_CONNECTED ? "OK" : "OFF");
-    M5Cardputer.Display.printf("Slot: ");
+    M5Cardputer.Display.setCursor(4, 29);
+    M5Cardputer.Display.printf("UTC %s", utcText);
+    M5Cardputer.Display.setCursor(4, 29 + kDisplayLineHeight);
+    M5Cardputer.Display.printf("Slot ");
     if (waitSec < 0) {
-        M5Cardputer.Display.printf("no sync\n");
+        M5Cardputer.Display.printf("--");
     } else {
-        M5Cardputer.Display.printf("%ds\n", waitSec);
+        M5Cardputer.Display.printf("%ds", waitSec);
     }
-    M5Cardputer.Display.printf("Freq: %.0f Hz\n", txToneHz);
-    M5Cardputer.Display.printf("Msg:\n%s\n", txMessage);
-    M5Cardputer.Display.setTextColor(isTransmitting ? TFT_ORANGE : TFT_CYAN, TFT_BLACK);
-    if (isTransmitting) {
-        M5Cardputer.Display.printf("TX running\n");
-    } else if (isReceiving) {
-        M5Cardputer.Display.printf("RX running\n");
-    } else {
-        M5Cardputer.Display.printf("Idle\n");
+    M5Cardputer.Display.drawFastHLine(4, 70, screenW - 8, TFT_DARKGREY);
+    M5Cardputer.Display.setCursor(4, 76);
+    M5Cardputer.Display.printf("Freq %.0fHz", txToneHz);
+    char displayMessage[19];
+    strncpy(displayMessage, txMessage, sizeof(displayMessage) - 1);
+    displayMessage[sizeof(displayMessage) - 1] = '\0';
+    M5Cardputer.Display.setCursor(4, 76 + kDisplayLineHeight);
+    M5Cardputer.Display.printf("%s", displayMessage);
+    renderCommandLine();
+}
+
+static void returnHomeForCommandInput()
+{
+    if (displayHoldUntilMs == 0) {
+        return;
     }
+
+    displayHoldUntilMs = 0;
+    renderStatus(true);
+}
+
+static uint8_t waterfallMagnitudeToByte(const WF_ELEM_T& value)
+{
+#ifdef WATERFALL_USE_PHASE
+    int scaled = static_cast<int>(2.0f * value.mag + 240.0f);
+    return static_cast<uint8_t>(scaled < 0 ? 0 : (scaled > 255 ? 255 : scaled));
+#else
+    return value;
+#endif
+}
+
+static uint16_t waterfallColor(uint8_t mag)
+{
+    if (mag < 50) {
+        return TFT_BLACK;
+    }
+    if (mag < 90) {
+        return TFT_NAVY;
+    }
+    if (mag < 130) {
+        return TFT_BLUE;
+    }
+    if (mag < 170) {
+        return TFT_CYAN;
+    }
+    if (mag < 215) {
+        return TFT_YELLOW;
+    }
+    return TFT_ORANGE;
+}
+
+static void renderRxWaterfall(const monitor_t& monitor)
+{
+    if (!kDrawRxWaterfall || monitor.wf.num_blocks == 0 || monitor.wf.mag == nullptr) {
+        return;
+    }
+
+    auto& display = M5Cardputer.Display;
+    int screenW = display.width();
+    int screenH = display.height();
+    const int left = 6;
+    const int top = 32;
+    const int right = screenW - 5;
+    const int bottom = screenH - 36;
+    const int plotW = max(1, right - left + 1);
+    const int plotH = max(1, bottom - top + 1);
+
+    if (monitor.wf.num_blocks == 1) {
+        display.fillRect(0, 0, screenW, screenH, TFT_BLACK);
+        display.drawRect(left - 1, top - 1, plotW + 2, plotH + 2, TFT_DARKGREY);
+        for (int x = 1; x < 4; ++x) {
+            int gx = left + (plotW * x) / 4;
+            display.drawFastVLine(gx, top, plotH, TFT_DARKGREY);
+        }
+        display.setTextSize(kDisplaySmallTextSize);
+        display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        display.setCursor(left, bottom + 4);
+        display.printf("%dHz", static_cast<int>(monitor.min_bin / monitor.symbol_period));
+        display.setCursor(screenW - 43, bottom + 4);
+        display.printf("%dHz", static_cast<int>((monitor.max_bin - 1) / monitor.symbol_period));
+    }
+
+    display.fillRect(0, 0, screenW, top - 1, TFT_BLACK);
+    display.setTextSize(kDisplayTextSize);
+    char progressText[12];
+    snprintf(progressText, sizeof(progressText), "%d/%d", monitor.wf.num_blocks, monitor.wf.max_blocks);
+    int rxX = screenW - 30;
+    int progressX = rxX - static_cast<int>(strlen(progressText)) * 12 - 8;
+    display.setTextColor(TFT_WHITE, TFT_BLACK);
+    display.setCursor(max(4, progressX), 4);
+    display.printf("%s", progressText);
+    display.setTextColor(TFT_GREEN, TFT_BLACK);
+    display.setCursor(rxX, 4);
+    display.printf("RX");
+    display.drawFastHLine(4, top - 4, screenW - 8, TFT_DARKGREY);
+
+    int block = monitor.wf.num_blocks - 1;
+    int y0 = top + (block * plotH) / monitor.wf.max_blocks;
+    int y1 = top + ((block + 1) * plotH) / monitor.wf.max_blocks;
+    int rowH = max(1, y1 - y0);
+    const int blockOffset = block * monitor.wf.block_stride;
+
+    uint8_t rowMin = 255;
+    uint8_t rowMax = 0;
+    for (int i = 0; i < monitor.wf.block_stride; ++i) {
+        uint8_t mag = waterfallMagnitudeToByte(monitor.wf.mag[blockOffset + i]);
+        if (mag < rowMin) {
+            rowMin = mag;
+        }
+        if (mag > rowMax) {
+            rowMax = mag;
+        }
+    }
+    int rowSpan = max(12, static_cast<int>(rowMax) - static_cast<int>(rowMin));
+
+    for (int x = 0; x < plotW; ++x) {
+        int firstBin = (x * monitor.wf.num_bins) / plotW;
+        int lastBin = ((x + 1) * monitor.wf.num_bins) / plotW;
+        if (lastBin <= firstBin) {
+            lastBin = firstBin + 1;
+        }
+
+        uint8_t columnMag = 0;
+        for (int timeSub = 0; timeSub < monitor.wf.time_osr; ++timeSub) {
+            for (int freqSub = 0; freqSub < monitor.wf.freq_osr; ++freqSub) {
+                int offset = blockOffset;
+                offset += ((timeSub * monitor.wf.freq_osr) + freqSub) * monitor.wf.num_bins;
+                for (int bin = firstBin; bin < lastBin && bin < monitor.wf.num_bins; ++bin) {
+                    uint8_t mag = waterfallMagnitudeToByte(monitor.wf.mag[offset + bin]);
+                    if (mag > columnMag) {
+                        columnMag = mag;
+                    }
+                }
+            }
+        }
+
+        int normalized = ((static_cast<int>(columnMag) - static_cast<int>(rowMin)) * 255) / rowSpan;
+        normalized = normalized < 0 ? 0 : (normalized > 255 ? 255 : normalized);
+        display.fillRect(left + x, y0, 1, rowH, waterfallColor(static_cast<uint8_t>(normalized)));
+    }
+    renderCommandLine();
 }
 
 static bool connectWifi(const char* ssid, const char* password, uint32_t timeoutMs = 15000)
 {
     if (ssid == nullptr || ssid[0] == '\0') {
-        Serial.println("WiFi SSID is empty. Use: wifi SSID PASSWORD");
+        Serial.println("WiFi SSID is empty. Use: set SSID your_wifi_name");
         return false;
     }
 
@@ -286,7 +452,7 @@ static bool syncTime(uint32_t timeoutMs = 15000)
 static bool waitForFt8Slot()
 {
     if (!timeIsSynced()) {
-        Serial.println("Time is not synced. Use: wifi SSID PASSWORD, then sync");
+        Serial.println("Time is not synced. Use: set SSID ..., set PASS ..., then sync");
         renderStatus(true);
         return false;
     }
@@ -342,11 +508,11 @@ static void ensureMicReady()
     if (!M5Cardputer.Mic.isEnabled()) {
         auto cfg = M5Cardputer.Mic.config();
         cfg.sample_rate = kAudioSampleRate;
-        cfg.left_channel = micUseLeftChannel ? 1 : 0;
+        cfg.left_channel = 1;
         cfg.stereo = 0;
         cfg.over_sampling = 1;
         cfg.noise_filter_level = 0;
-        cfg.magnification = micMagnification;
+        cfg.magnification = 64;
         cfg.dma_buf_len = 256;
         cfg.dma_buf_count = 8;
         M5Cardputer.Mic.config(cfg);
@@ -378,7 +544,10 @@ static void decodeWaterfall(const monitor_t& monitor)
 
     if (candidateList == nullptr || decoded == nullptr || decodedHashtable == nullptr) {
         Serial.println("RX decode allocation failed");
+        M5Cardputer.Display.setTextSize(kDisplayTextSize);
+        M5Cardputer.Display.setTextColor(TFT_RED, TFT_BLACK);
         M5Cardputer.Display.printf("Decode alloc fail\n");
+        renderCommandLine();
         free(decodedHashtable);
         free(decoded);
         free(candidateList);
@@ -392,10 +561,14 @@ static void decodeWaterfall(const monitor_t& monitor)
 
     M5Cardputer.Display.fillScreen(TFT_BLACK);
     M5Cardputer.Display.setCursor(4, 4);
+    M5Cardputer.Display.setTextSize(kDisplayTextSize);
     M5Cardputer.Display.setTextColor(TFT_GREEN, TFT_BLACK);
-    M5Cardputer.Display.printf("RX decode\n");
+    M5Cardputer.Display.printf("RX decode");
+    M5Cardputer.Display.drawFastHLine(4, 23, M5Cardputer.Display.width() - 8, TFT_DARKGREY);
     M5Cardputer.Display.setTextColor(TFT_WHITE, TFT_BLACK);
-    M5Cardputer.Display.printf("Cand: %d\n", numCandidates);
+    M5Cardputer.Display.setCursor(4, 30);
+    M5Cardputer.Display.printf("Cand %d", numCandidates);
+    M5Cardputer.Display.drawFastHLine(4, 51, M5Cardputer.Display.width() - 8, TFT_DARKGREY);
 
     for (int idx = 0; idx < numCandidates; ++idx) {
         const ftx_candidate_t* candidate = &candidateList[idx];
@@ -446,15 +619,22 @@ static void decodeWaterfall(const monitor_t& monitor)
         }
 
         Serial.printf("FT8 %+05.1f dB %+4.2f s %4.0f Hz ~ %s\n", snr, timeSec, freqHz, text);
-        if (numDecoded <= 5) {
-            M5Cardputer.Display.printf("%4.0fHz %s\n", freqHz, text);
+        if (numDecoded <= 4) {
+            char shortText[15];
+            strncpy(shortText, text, sizeof(shortText) - 1);
+            shortText[sizeof(shortText) - 1] = '\0';
+            M5Cardputer.Display.setCursor(4, 56 + (numDecoded - 1) * kDisplayLineHeight);
+            M5Cardputer.Display.printf("%4.0f %s", freqHz, shortText);
         }
     }
 
     Serial.printf("RX decoded: %d, callsign hashes: %d\n", numDecoded, callsignHashtableSize);
     if (numDecoded == 0) {
-        M5Cardputer.Display.printf("No decode\n");
+        M5Cardputer.Display.setCursor(4, 56);
+        M5Cardputer.Display.setTextColor(TFT_ORANGE, TFT_BLACK);
+        M5Cardputer.Display.printf("No decode");
     }
+    renderCommandLine();
     displayHoldUntilMs = millis() + 15000;
     hashtableCleanup(10);
 
@@ -481,7 +661,10 @@ static void runDecodeWaterfall(const monitor_t& monitor)
     SemaphoreHandle_t done = xSemaphoreCreateBinary();
     if (done == nullptr) {
         Serial.println("RX decode semaphore allocation failed");
+        M5Cardputer.Display.setTextSize(kDisplayTextSize);
+        M5Cardputer.Display.setTextColor(TFT_RED, TFT_BLACK);
         M5Cardputer.Display.printf("Decode semaphore fail\n");
+        renderCommandLine();
         return;
     }
 
@@ -497,7 +680,10 @@ static void runDecodeWaterfall(const monitor_t& monitor)
 
     if (created != pdPASS) {
         Serial.println("RX decode task allocation failed");
+        M5Cardputer.Display.setTextSize(kDisplayTextSize);
+        M5Cardputer.Display.setTextColor(TFT_RED, TFT_BLACK);
         M5Cardputer.Display.printf("Decode task fail\n");
+        renderCommandLine();
     } else {
         xSemaphoreTake(done, portMAX_DELAY);
     }
@@ -508,7 +694,7 @@ static void runDecodeWaterfall(const monitor_t& monitor)
 static bool receiveOnce()
 {
     if (!timeIsSynced()) {
-        Serial.println("Time is not synced. Use: wifi SSID PASSWORD, then sync");
+        Serial.println("Time is not synced. Use: set SSID ..., set PASS ..., then sync");
         renderStatus(true);
         return false;
     }
@@ -578,8 +764,11 @@ static bool receiveOnce()
     rxSampleTotal = 0;
     M5Cardputer.Display.fillScreen(TFT_BLACK);
     M5Cardputer.Display.setCursor(4, 4);
+    M5Cardputer.Display.setTextSize(kDisplayTextSize);
     M5Cardputer.Display.setTextColor(TFT_RED, TFT_BLACK);
-    M5Cardputer.Display.printf("RX capture\n");
+    M5Cardputer.Display.printf("RX capture");
+    M5Cardputer.Display.drawFastHLine(4, 23, M5Cardputer.Display.width() - 8, TFT_DARKGREY);
+    renderCommandLine();
 
     while (monitor.wf.num_blocks < monitor.wf.max_blocks) {
         if (!M5Cardputer.Mic.record(rxPcm, monitor.block_size, kAudioSampleRate, false)) {
@@ -599,6 +788,7 @@ static bool receiveOnce()
         rxSampleTotal += monitor.block_size;
 
         monitor_process(&monitor, rxFrame);
+        renderRxWaterfall(monitor);
         if ((monitor.wf.num_blocks % 10) == 0) {
             Serial.print(".");
         }
@@ -617,45 +807,6 @@ static bool receiveOnce()
 
     isReceiving = false;
     return true;
-}
-
-static void micTest(uint32_t durationMs = 2000)
-{
-    xSemaphoreTake(radioMutex, portMAX_DELAY);
-    Serial.printf("Mic test: channel=%s magnification=%u\n",
-        micUseLeftChannel ? "left" : "right", micMagnification);
-    ensureMicReady();
-    if (!M5Cardputer.Mic.isEnabled()) {
-        Serial.println("Mic begin failed");
-        xSemaphoreGive(radioMutex);
-        return;
-    }
-
-    uint32_t start = millis();
-    int32_t peak = 0;
-    uint64_t absSum = 0;
-    uint32_t total = 0;
-    while (millis() - start < durationMs) {
-        if (!M5Cardputer.Mic.record(rxPcm, kFt8BlockSamples, kAudioSampleRate, false)) {
-            delay(1);
-            continue;
-        }
-        for (int i = 0; i < kFt8BlockSamples; ++i) {
-            int32_t mag = abs(static_cast<int32_t>(rxPcm[i]));
-            if (mag > peak) {
-                peak = mag;
-            }
-            absSum += mag;
-        }
-        total += kFt8BlockSamples;
-    }
-
-    stopMicAndRestoreSpeaker();
-    Serial.printf("Mic test peak=%ld avg_abs=%lu samples=%lu\n",
-        static_cast<long>(peak),
-        static_cast<unsigned long>(total ? absSum / total : 0),
-        static_cast<unsigned long>(total));
-    xSemaphoreGive(radioMutex);
 }
 
 static float gfskPulseValue(int index, int samplesPerSymbol)
@@ -795,7 +946,7 @@ static bool transmitFt8(const char* text, float baseToneHz, bool waitForSlot)
     if (!waitForSlot) {
         renderStatus(true);
     }
-    Serial.printf("Playing at %.1f Hz\n", baseToneHz);
+    Serial.printf("TX audio at %.1f Hz\n", baseToneHz);
     M5Cardputer.Speaker.stop();
     writeSilenceSamples(silenceSamples);
 
@@ -816,7 +967,7 @@ static bool transmitFt8(const char* text, float baseToneHz, bool waitForSlot)
     while (M5Cardputer.Speaker.isPlaying(kSpeakerChannel)) {
         delay(1);
     }
-    Serial.println("Play done");
+    Serial.println("TX done");
     M5Cardputer.Speaker.end();
     isTransmitting = false;
     renderStatus(true);
@@ -851,6 +1002,7 @@ static String readSerialLine()
         if (ch == '\r') {
             continue;
         }
+        returnHomeForCommandInput();
         if (ch == '\n') {
             String out = line;
             line = "";
@@ -860,6 +1012,131 @@ static String readSerialLine()
         line += ch;
     }
     return String();
+}
+
+static String readKeyboardLine()
+{
+    if (!M5Cardputer.Keyboard.isChange() || !M5Cardputer.Keyboard.isPressed()) {
+        return String();
+    }
+
+    Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
+    bool changed = false;
+    bool hasCommandInput = status.enter || (status.del && keyboardCommand.length() > 0) ||
+        (status.space && keyboardCommand.length() < kCommandMaxLength);
+    if (!hasCommandInput) {
+        for (char ch : status.word) {
+            if (keyboardCommand.length() < kCommandMaxLength && ch >= 32 && ch <= 126) {
+                hasCommandInput = true;
+                break;
+            }
+        }
+    }
+    if (hasCommandInput) {
+        returnHomeForCommandInput();
+    }
+
+    for (char ch : status.word) {
+        if (keyboardCommand.length() < kCommandMaxLength && ch >= 32 && ch <= 126) {
+            keyboardCommand += ch;
+            changed = true;
+        }
+    }
+    if (status.space && status.word.empty() && keyboardCommand.length() < kCommandMaxLength) {
+        keyboardCommand += ' ';
+        changed = true;
+    }
+    if (status.del && keyboardCommand.length() > 0) {
+        keyboardCommand.remove(keyboardCommand.length() - 1);
+        changed = true;
+    }
+    if (status.enter) {
+        String out = keyboardCommand;
+        out.trim();
+        keyboardCommand = "";
+        renderCommandLine();
+        return out;
+    }
+    if (changed) {
+        renderCommandLine();
+    }
+    return String();
+}
+
+static void printCommandHelp()
+{
+    Serial.println("CardFTx commands:");
+    Serial.println("  set freq 1000");
+    Serial.println("  set msg CQ BG6WRI ON80");
+    Serial.println("  set SSID your_wifi_name");
+    Serial.println("  set PASS your_wifi_password");
+    Serial.println("  sync");
+    Serial.println("  tx");
+    Serial.println("  rx | rx once");
+    Serial.println("  show");
+}
+
+static void handleCommand(const String& input)
+{
+    String line = input;
+    line.trim();
+    if (line.length() == 0) {
+        return;
+    }
+
+    String lower = line;
+    lower.toLowerCase();
+
+    if (lower == "help" || lower == "?") {
+        printCommandHelp();
+    } else if (lower == "sync") {
+        if (connectWifi(wifiSsid, wifiPassword)) {
+            syncTime();
+        }
+    } else if (lower.startsWith("set msg ")) {
+        setTxMessage(line.substring(8));
+        renderStatus(true);
+    } else if (lower.startsWith("set freq ")) {
+        float value = line.substring(9).toFloat();
+        if (value < 200.0f || value > 3000.0f) {
+            Serial.println("Frequency must be 200..3000 Hz");
+        } else {
+            txToneHz = value;
+            Serial.printf("TX audio frequency=%.1f Hz\n", txToneHz);
+            renderStatus(true);
+        }
+    } else if (lower.startsWith("set ssid ")) {
+        String value = line.substring(9);
+        value.trim();
+        value.toCharArray(wifiSsid, sizeof(wifiSsid));
+        Serial.printf("WiFi SSID set: %s\n", wifiSsid);
+        renderStatus(true);
+    } else if (lower.startsWith("set pass ")) {
+        String value = line.substring(9);
+        value.trim();
+        value.toCharArray(wifiPassword, sizeof(wifiPassword));
+        Serial.println("WiFi password set");
+        renderStatus(true);
+    } else if (lower == "show") {
+        char utcText[16];
+        formatUtcTime(utcText, sizeof(utcText));
+        Serial.printf("Message: %s\n", txMessage);
+        Serial.printf("TX audio frequency: %.1f Hz\n", txToneHz);
+        Serial.printf("WiFi SSID: %s\n", wifiSsid);
+        Serial.printf("UTC: %s, synced=%s\n", utcText, timeIsSynced() ? "yes" : "no");
+        Serial.printf("WiFi: %s\n", WiFi.status() == WL_CONNECTED ? "connected" : "disconnected");
+        renderStatus(true);
+    } else if (lower == "tx") {
+        xSemaphoreTake(radioMutex, portMAX_DELAY);
+        transmitFt8(txMessage, txToneHz, true);
+        xSemaphoreGive(radioMutex);
+    } else if (lower == "rx" || lower == "rx once") {
+        xSemaphoreTake(radioMutex, portMAX_DELAY);
+        receiveOnce();
+        xSemaphoreGive(radioMutex);
+    } else {
+        Serial.println("Unknown command. Type: help");
+    }
 }
 
 bool ft8AppBegin()
@@ -876,20 +1153,29 @@ bool ft8AppBegin()
     Serial.println("TX audio uses M5Cardputer.Speaker");
     Serial.println("RX audio uses M5Cardputer.Mic");
 
+    strncpy(wifiSsid, kDefaultWifiSsid, sizeof(wifiSsid) - 1);
+    wifiSsid[sizeof(wifiSsid) - 1] = '\0';
+    strncpy(wifiPassword, kDefaultWifiPassword, sizeof(wifiPassword) - 1);
+    wifiPassword[sizeof(wifiPassword) - 1] = '\0';
+
     hashtableInit();
     renderStatus(true);
 
-    if (kDefaultWifiSsid[0] != '\0' && connectWifi(kDefaultWifiSsid, kDefaultWifiPassword)) {
+    if (wifiSsid[0] != '\0' && connectWifi(wifiSsid, wifiPassword)) {
         syncTime();
     }
 
-    Serial.println("CardFTx ready. Commands: wifi SSID PASS | sync | msg CQ TEST AB12 | freq 1000 | play | playnow | tx MESSAGE | txnow MESSAGE | rxonce | mictest | beep");
+    Serial.println("CardFTx ready.");
+    printCommandHelp();
     return true;
 }
 
 void ft8AppLoop()
 {
     String line = readSerialLine();
+    if (line.length() == 0) {
+        line = readKeyboardLine();
+    }
     if (line.length() == 0) {
         if (!isTransmitting) {
             renderStatus();
@@ -898,101 +1184,5 @@ void ft8AppLoop()
         return;
     }
 
-    if (line.startsWith("wifi ")) {
-        String args = line.substring(5);
-        int split = args.indexOf(' ');
-        if (split < 0) {
-            Serial.println("Use: wifi SSID PASSWORD");
-        } else {
-            String ssid = args.substring(0, split);
-            String password = args.substring(split + 1);
-            password.trim();
-            if (connectWifi(ssid.c_str(), password.c_str())) {
-                syncTime();
-            }
-        }
-    } else if (line == "sync") {
-        syncTime();
-    } else if (line.startsWith("msg ")) {
-        setTxMessage(line.substring(4));
-        renderStatus(true);
-    } else if (line.startsWith("freq ")) {
-        float value = line.substring(5).toFloat();
-        if (value < 200.0f || value > 3000.0f) {
-            Serial.println("Frequency must be 200..3000 Hz");
-        } else {
-            txToneHz = value;
-            Serial.printf("TX audio frequency=%.1f Hz\n", txToneHz);
-            renderStatus(true);
-        }
-    } else if (line == "show") {
-        char utcText[16];
-        formatUtcTime(utcText, sizeof(utcText));
-        Serial.printf("Message: %s\n", txMessage);
-        Serial.printf("TX audio frequency: %.1f Hz\n", txToneHz);
-        Serial.printf("UTC: %s, synced=%s\n", utcText, timeIsSynced() ? "yes" : "no");
-        Serial.printf("WiFi: %s\n", WiFi.status() == WL_CONNECTED ? "connected" : "disconnected");
-        renderStatus(true);
-    } else if (line == "beep") {
-        xSemaphoreTake(radioMutex, portMAX_DELAY);
-        playTestTone(1000.0f, 3000);
-        xSemaphoreGive(radioMutex);
-    } else if (line.startsWith("beep ")) {
-        float value = line.substring(5).toFloat();
-        if (value < 50.0f || value > 6000.0f) {
-            Serial.println("Beep frequency must be 50..6000 Hz");
-        } else {
-            xSemaphoreTake(radioMutex, portMAX_DELAY);
-            playTestTone(value, 3000);
-            xSemaphoreGive(radioMutex);
-        }
-    } else if (line == "play") {
-        xSemaphoreTake(radioMutex, portMAX_DELAY);
-        transmitFt8(txMessage, txToneHz, true);
-        xSemaphoreGive(radioMutex);
-    } else if (line == "playnow") {
-        xSemaphoreTake(radioMutex, portMAX_DELAY);
-        transmitFt8(txMessage, txToneHz, false);
-        xSemaphoreGive(radioMutex);
-    } else if (line == "rxonce") {
-        xSemaphoreTake(radioMutex, portMAX_DELAY);
-        receiveOnce();
-        xSemaphoreGive(radioMutex);
-    } else if (line == "mictest" || line == "esmic") {
-        micTest();
-    } else if (line == "mic left") {
-        micUseLeftChannel = true;
-        Serial.println("Mic channel: left");
-    } else if (line == "mic right") {
-        micUseLeftChannel = false;
-        Serial.println("Mic channel: right");
-    } else if (line.startsWith("micgain ")) {
-        int value = line.substring(8).toInt();
-        if (value < 1 || value > 255) {
-            Serial.println("Mic gain must be 1..255");
-        } else {
-            micMagnification = static_cast<uint8_t>(value);
-            Serial.printf("Mic magnification=%u\n", micMagnification);
-        }
-    } else if (line == "rx on") {
-        Serial.println("Continuous RX is not implemented yet. Use: rxonce");
-    } else if (line == "rx off") {
-        Serial.println("RX is idle");
-    } else if (line.startsWith("tx ")) {
-        String message = line.substring(3);
-        xSemaphoreTake(radioMutex, portMAX_DELAY);
-        transmitFt8(message.c_str(), txToneHz, true);
-        xSemaphoreGive(radioMutex);
-    } else if (line.startsWith("txnow ")) {
-        String message = line.substring(6);
-        xSemaphoreTake(radioMutex, portMAX_DELAY);
-        transmitFt8(message.c_str(), txToneHz, false);
-        xSemaphoreGive(radioMutex);
-    } else if (line.startsWith("vol ")) {
-        uint8_t value = static_cast<uint8_t>(line.substring(4).toInt());
-        M5Cardputer.Speaker.setVolume(value);
-        Serial.printf("volume=%u\n", value);
-    } else {
-        Serial.println("Unknown command. Use: wifi SSID PASS | sync | msg MESSAGE | freq HZ | play | playnow | tx MESSAGE | txnow MESSAGE | rxonce | mictest | beep");
-    }
+    handleCommand(line);
 }
