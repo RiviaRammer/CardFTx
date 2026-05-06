@@ -29,6 +29,7 @@ static constexpr int kLdpcIterations = 25;
 static constexpr int kMaxDecodedMessages = 50;
 static constexpr int kSpeakerChunkSamples = 512;
 static constexpr int kSpeakerChannel = 0;
+static constexpr uint32_t kDecodeTaskStackBytes = 16 * 1024;
 static constexpr int kFt8BlockSamples = static_cast<int>(kAudioSampleRate * FT8_SYMBOL_PERIOD);
 static constexpr float kFt8SymbolBt = 2.0f;
 static constexpr float kGfskConstK = 5.336446f;
@@ -120,6 +121,25 @@ static bool hashtableLookup(ftx_callsign_hash_type_t hashType, uint32_t hash, ch
 
 static ftx_callsign_hash_interface_t hashIf = { hashtableLookup, hashtableAdd };
 
+static void* appHeapMalloc(size_t size)
+{
+    void* ptr = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (ptr == nullptr) {
+        ptr = heap_caps_malloc(size, MALLOC_CAP_8BIT);
+    }
+    return ptr;
+}
+
+static void* appHeapCalloc(size_t count, size_t size)
+{
+    size_t total = count * size;
+    void* ptr = appHeapMalloc(total);
+    if (ptr != nullptr) {
+        memset(ptr, 0, total);
+    }
+    return ptr;
+}
+
 static bool timeIsSynced()
 {
     time_t now = time(nullptr);
@@ -172,7 +192,7 @@ static void renderStatus(bool force = false)
     M5Cardputer.Display.setTextColor(TFT_GREEN, TFT_BLACK);
     M5Cardputer.Display.setTextSize(1);
     M5Cardputer.Display.setCursor(4, 4);
-    M5Cardputer.Display.printf("CardFTx FT8 TX\n");
+    M5Cardputer.Display.printf("CardFTx FT8\n");
     M5Cardputer.Display.setTextColor(TFT_WHITE, TFT_BLACK);
     M5Cardputer.Display.printf("UTC: %s\n", utcText);
     M5Cardputer.Display.printf("WiFi: %s\n", WiFi.status() == WL_CONNECTED ? "OK" : "OFF");
@@ -341,10 +361,23 @@ static void stopMicAndRestoreSpeaker()
 static void decodeWaterfall(const monitor_t& monitor)
 {
     const ftx_waterfall_t* wf = &monitor.wf;
-    ftx_candidate_t candidateList[kMaxCandidates];
+    ftx_candidate_t* candidateList = static_cast<ftx_candidate_t*>(
+        appHeapMalloc(sizeof(ftx_candidate_t) * kMaxCandidates));
+    ftx_message_t* decoded = static_cast<ftx_message_t*>(
+        appHeapMalloc(sizeof(ftx_message_t) * kMaxDecodedMessages));
+    ftx_message_t** decodedHashtable = static_cast<ftx_message_t**>(
+        appHeapCalloc(kMaxDecodedMessages, sizeof(ftx_message_t*)));
+
+    if (candidateList == nullptr || decoded == nullptr || decodedHashtable == nullptr) {
+        Serial.println("RX decode allocation failed");
+        M5Cardputer.Display.printf("Decode alloc fail\n");
+        free(decodedHashtable);
+        free(decoded);
+        free(candidateList);
+        return;
+    }
+
     int numCandidates = ftx_find_candidates(wf, kMaxCandidates, candidateList, kMinScore);
-    ftx_message_t decoded[kMaxDecodedMessages];
-    ftx_message_t* decodedHashtable[kMaxDecodedMessages] = {};
     int numDecoded = 0;
 
     Serial.printf("RX candidates: %d, max_mag=%.1f dB\n", numCandidates, monitor.max_mag);
@@ -411,6 +444,52 @@ static void decodeWaterfall(const monitor_t& monitor)
     }
     displayHoldUntilMs = millis() + 15000;
     hashtableCleanup(10);
+
+    free(decodedHashtable);
+    free(decoded);
+    free(candidateList);
+}
+
+struct DecodeTaskContext {
+    const monitor_t* monitor;
+    SemaphoreHandle_t done;
+};
+
+static void decodeWaterfallTask(void* arg)
+{
+    DecodeTaskContext* context = static_cast<DecodeTaskContext*>(arg);
+    decodeWaterfall(*context->monitor);
+    xSemaphoreGive(context->done);
+    vTaskDelete(nullptr);
+}
+
+static void runDecodeWaterfall(const monitor_t& monitor)
+{
+    SemaphoreHandle_t done = xSemaphoreCreateBinary();
+    if (done == nullptr) {
+        Serial.println("RX decode semaphore allocation failed");
+        M5Cardputer.Display.printf("Decode semaphore fail\n");
+        return;
+    }
+
+    DecodeTaskContext context = { &monitor, done };
+    BaseType_t created = xTaskCreatePinnedToCore(
+        decodeWaterfallTask,
+        "ft8Decode",
+        kDecodeTaskStackBytes,
+        &context,
+        1,
+        nullptr,
+        1);
+
+    if (created != pdPASS) {
+        Serial.println("RX decode task allocation failed");
+        M5Cardputer.Display.printf("Decode task fail\n");
+    } else {
+        xSemaphoreTake(done, portMAX_DELAY);
+    }
+
+    vSemaphoreDelete(done);
 }
 
 static bool receiveOnce()
@@ -520,7 +599,7 @@ static bool receiveOnce()
         static_cast<unsigned long>(rxSampleTotal));
 
     stopMicAndRestoreSpeaker();
-    decodeWaterfall(monitor);
+    runDecodeWaterfall(monitor);
     monitor_free(&monitor);
 
     isReceiving = false;
@@ -782,6 +861,7 @@ bool ft8AppBegin()
     }
 
     Serial.println("TX audio uses M5Cardputer.Speaker");
+    Serial.println("RX audio uses M5Cardputer.Mic");
 
     hashtableInit();
     renderStatus(true);
@@ -790,7 +870,7 @@ bool ft8AppBegin()
         syncTime();
     }
 
-    Serial.println("CardFTx ready. Commands: wifi SSID PASS | sync | msg CQ TEST AB12 | freq 1000 | play | playnow | tx MESSAGE | txnow MESSAGE | beep");
+    Serial.println("CardFTx ready. Commands: wifi SSID PASS | sync | msg CQ TEST AB12 | freq 1000 | play | playnow | tx MESSAGE | txnow MESSAGE | rxonce | mictest | beep");
     return true;
 }
 
@@ -861,13 +941,30 @@ void ft8AppLoop()
         xSemaphoreTake(radioMutex, portMAX_DELAY);
         transmitFt8(txMessage, txToneHz, false);
         xSemaphoreGive(radioMutex);
-    } else if (line == "rxonce" || line == "mictest" || line == "esmic" ||
-        line == "mic left" || line == "mic right" || line.startsWith("micgain ")) {
-        Serial.println("RX/mic commands are disabled in this TX-only build.");
+    } else if (line == "rxonce") {
+        xSemaphoreTake(radioMutex, portMAX_DELAY);
+        receiveOnce();
+        xSemaphoreGive(radioMutex);
+    } else if (line == "mictest" || line == "esmic") {
+        micTest();
+    } else if (line == "mic left") {
+        micUseLeftChannel = true;
+        Serial.println("Mic channel: left");
+    } else if (line == "mic right") {
+        micUseLeftChannel = false;
+        Serial.println("Mic channel: right");
+    } else if (line.startsWith("micgain ")) {
+        int value = line.substring(8).toInt();
+        if (value < 1 || value > 255) {
+            Serial.println("Mic gain must be 1..255");
+        } else {
+            micMagnification = static_cast<uint8_t>(value);
+            Serial.printf("Mic magnification=%u\n", micMagnification);
+        }
     } else if (line == "rx on") {
-        Serial.println("RX is disabled in this TX-only build.");
+        Serial.println("Continuous RX is not implemented yet. Use: rxonce");
     } else if (line == "rx off") {
-        Serial.println("RX is disabled in this TX-only build.");
+        Serial.println("RX is idle");
     } else if (line.startsWith("tx ")) {
         String message = line.substring(3);
         xSemaphoreTake(radioMutex, portMAX_DELAY);
@@ -883,6 +980,6 @@ void ft8AppLoop()
         M5Cardputer.Speaker.setVolume(value);
         Serial.printf("volume=%u\n", value);
     } else {
-        Serial.println("Unknown command. Use: wifi SSID PASS | sync | msg MESSAGE | freq HZ | play | playnow | tx MESSAGE | txnow MESSAGE | beep");
+        Serial.println("Unknown command. Use: wifi SSID PASS | sync | msg MESSAGE | freq HZ | play | playnow | tx MESSAGE | txnow MESSAGE | rxonce | mictest | beep");
     }
 }

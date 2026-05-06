@@ -36,10 +36,13 @@ Open Serial Monitor at `115200`.
 - `tx CQ TEST AB12` encodes one message, waits for the next FT8 boundary, and plays it without changing the stored test message.
 - `txnow CQ TEST AB12` plays immediately for bench testing.
 - `rxonce` turns off the speaker, enables the built-in microphone, captures one FT8 window at the next UTC 15 second boundary, and decodes it.
+- `mictest` captures a short microphone window and prints peak/average sample levels.
+- `mic left` / `mic right` selects the `M5Cardputer.Mic` channel used for RX.
+- `micgain 64` changes the `M5Cardputer.Mic` magnification used for RX.
 - `show` prints the stored message, frequency, Wi-Fi state, and UTC sync state.
 - `vol 255` sets the M5Cardputer speaker volume.
 
-The receiver continuously captures 15 second windows at 12 kHz and prints decoded candidates:
+The receiver captures a 15 second FT8 window at 12 kHz with `M5Cardputer.Mic` and prints decoded candidates:
 
 ```text
 FT8 +12.5 dB +0.80 s 1000 Hz ~ CQ TEST AB12
