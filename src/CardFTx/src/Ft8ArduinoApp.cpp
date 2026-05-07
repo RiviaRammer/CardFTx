@@ -33,15 +33,15 @@ static constexpr int kCallsignHashTableSize = 256;
 static constexpr int kSpeakerChunkSamples = 512;
 static constexpr int kSpeakerChannel = 0;
 static constexpr uint32_t kRadioTaskStackBytes = 24 * 1024;
+static constexpr int kFt8BlockSamples = static_cast<int>(kAudioSampleRate * FT8_SYMBOL_PERIOD);
 static constexpr uint8_t kDisplayTextSize = 2;
 static constexpr uint8_t kDisplaySmallTextSize = 1;
 static constexpr int kDisplayLineHeight = 18;
 static constexpr int kCommandMaxLength = 63;
-static constexpr float kFtxSymbolBt = 2.0f;
+static constexpr float kFt8SymbolBt = 2.0f;
 static constexpr float kGfskConstK = 5.336446f;
 static constexpr int kDecodeHistorySize = 8;
 static constexpr uint8_t kHidKeyEscape = 0x29;
-static constexpr uint8_t kHidKeyM = 0x10;
 
 enum class RadioPhase : uint8_t {
     Boot,
@@ -56,7 +56,8 @@ enum class RadioPhase : uint8_t {
 
 enum class UiView : uint8_t {
     Home,
-    History,
+    TxSetting,
+    Message,
     Waterfall
 };
 
@@ -71,28 +72,27 @@ struct DecodeHistoryItem {
 static TaskHandle_t radioTaskHandle;
 static SemaphoreHandle_t displayMutex;
 static portMUX_TYPE appStateMux = portMUX_INITIALIZER_UNLOCKED;
-static char txMessage[FTX_MAX_MESSAGE_LENGTH] = "CQ BG6WRI ON80";
-static float txToneHz = kFt8DefaultToneHz;
+static char txMessage[FTX_MAX_MESSAGE_LENGTH];
+static float txToneHz = kFtxDefaultToneHz;
+static bool txSlotOdd = false;
 static int16_t speakerBuffers[3][kSpeakerChunkSamples];
 static uint8_t speakerBufferIndex = 0;
 static bool isTransmitting = false;
 static bool isReceiving = false;
 static bool txRequested = false;
 static bool txCancelRequested = false;
-static bool radioAbortRequested = false;
 static RadioPhase radioPhase = RadioPhase::Boot;
-static ftx_protocol_t activeProtocol = FTX_PROTOCOL_FT8;
 static UiView uiView = UiView::Home;
 static int latestRxDecodedCount = 0;
 static int unreadDecodedCount = 0;
-static int32_t latestRxPeak = 0;
-static uint32_t latestRxAvgAbs = 0;
 static DecodeHistoryItem decodeHistory[kDecodeHistorySize];
 static int decodeHistoryCount = 0;
 static uint32_t lastDisplayMs = 0;
 static uint32_t displayHoldUntilMs = 0;
 static bool waterfallFrameDrawn = false;
 static String keyboardCommand;
+static int16_t rxPcm[kFt8BlockSamples];
+static float rxFrame[kFt8BlockSamples];
 static int32_t rxPeak = 0;
 static uint64_t rxAbsSum = 0;
 static uint32_t rxSampleTotal = 0;
@@ -105,6 +105,24 @@ static struct {
 } callsignHashtable[kCallsignHashTableSize];
 
 static int callsignHashtableSize = 0;
+
+static void formatStandardTxMessage(int index, char* out, size_t outSize)
+{
+    switch (index) {
+    case 0:
+        snprintf(out, outSize, "CQ %s %s", kFtxStationCallsign, kFtxStationGrid);
+        break;
+    case 1:
+        snprintf(out, outSize, "%s %s", kFtxStationCallsign, kFtxDefaultReport);
+        break;
+    case 2:
+        snprintf(out, outSize, "%s RR73", kFtxStationCallsign);
+        break;
+    default:
+        snprintf(out, outSize, "%s 73", kFtxStationCallsign);
+        break;
+    }
+}
 
 static void hashtableInit()
 {
@@ -214,57 +232,37 @@ static void formatUtcTime(char* out, size_t outSize)
     snprintf(out, outSize, "%02d:%02d:%02d", utc.tm_hour, utc.tm_min, utc.tm_sec);
 }
 
-static const ftx_protocol_info_t* protocolInfo(ftx_protocol_t protocol)
+static void formatUtcTimestamp(uint32_t timestamp, char* out, size_t outSize)
 {
-    return ftx_protocol_info(protocol);
+    if (timestamp == 0) {
+        snprintf(out, outSize, "--:--:--");
+        return;
+    }
+
+    time_t value = static_cast<time_t>(timestamp);
+    struct tm utc;
+    gmtime_r(&value, &utc);
+    snprintf(out, outSize, "%02d:%02d:%02d", utc.tm_hour, utc.tm_min, utc.tm_sec);
 }
 
-static const char* protocolLabel(ftx_protocol_t protocol)
-{
-    return protocolInfo(protocol)->label;
-}
-
-static int64_t protocolSlotPeriodUs(ftx_protocol_t protocol)
-{
-    return static_cast<int64_t>(protocolInfo(protocol)->slot_time * 1000000.0f + 0.5f);
-}
-
-static ftx_protocol_t currentProtocol()
-{
-    ftx_protocol_t protocol;
-    portENTER_CRITICAL(&appStateMux);
-    protocol = activeProtocol;
-    portEXIT_CRITICAL(&appStateMux);
-    return protocol;
-}
-
-static int secondsToNextSlot(ftx_protocol_t protocol)
+static int secondsToNextFt8Slot()
 {
     if (!timeIsSynced()) {
         return -1;
     }
 
-    struct timeval tv;
-    gettimeofday(&tv, nullptr);
-    int64_t nowUs = (static_cast<int64_t>(tv.tv_sec) * 1000000LL) + tv.tv_usec;
-    int64_t periodUs = protocolSlotPeriodUs(protocol);
-    int64_t remainingUs = periodUs - (nowUs % periodUs);
-    if (remainingUs == periodUs) {
-        remainingUs = 0;
-    }
-    return static_cast<int>((remainingUs + 999999LL) / 1000000LL);
+    time_t now = time(nullptr);
+    int sec = static_cast<int>(now % 15);
+    return (15 - sec) % 15;
 }
 
-static bool currentSlotIsOdd(ftx_protocol_t protocol)
+static bool currentSlotIsOdd()
 {
     if (!timeIsSynced()) {
         return false;
     }
 
-    struct timeval tv;
-    gettimeofday(&tv, nullptr);
-    int64_t nowUs = (static_cast<int64_t>(tv.tv_sec) * 1000000LL) + tv.tv_usec;
-    return ((nowUs / protocolSlotPeriodUs(protocol)) & 1) != 0;
+    return ((time(nullptr) / 15) & 1) != 0;
 }
 
 static const char* phaseText(RadioPhase phase)
@@ -275,13 +273,13 @@ static const char* phaseText(RadioPhase phase)
     case RadioPhase::WaitSync:
         return "Sync";
     case RadioPhase::WaitRxSlot:
-        return "Blank";
+        return "Wait RX";
     case RadioPhase::RxCapture:
         return "RX";
     case RadioPhase::RxDecode:
         return "Decode";
     case RadioPhase::WaitTxSlot:
-        return "Blank";
+        return "Wait TX";
     case RadioPhase::TxTransmit:
         return "TX";
     case RadioPhase::Error:
@@ -290,7 +288,47 @@ static const char* phaseText(RadioPhase phase)
     return "--";
 }
 
+static const char* displayPhaseText(RadioPhase phase)
+{
+    switch (phase) {
+    case RadioPhase::WaitRxSlot:
+    case RadioPhase::RxCapture:
+        return "RX";
+    case RadioPhase::WaitTxSlot:
+    case RadioPhase::TxTransmit:
+        return "TX";
+    default:
+        return phaseText(phase);
+    }
+}
+
 static const char* nextActionText(RadioPhase phase, bool pendingTx)
+{
+    if (pendingTx && phase != RadioPhase::TxTransmit && phase != RadioPhase::WaitTxSlot) {
+        return "TX next slot";
+    }
+
+    switch (phase) {
+    case RadioPhase::WaitSync:
+        return "Need UTC sync";
+    case RadioPhase::WaitRxSlot:
+        return "Capture";
+    case RadioPhase::RxCapture:
+        return "Decode";
+    case RadioPhase::RxDecode:
+        return pendingTx ? "TX next slot" : "RX next slot";
+    case RadioPhase::WaitTxSlot:
+        return "Transmit";
+    case RadioPhase::TxTransmit:
+        return "Return RX";
+    case RadioPhase::Error:
+        return "Check serial";
+    default:
+        return "RX";
+    }
+}
+
+static const char* displayNextActionText(RadioPhase phase, bool pendingTx)
 {
     if (pendingTx && phase != RadioPhase::TxTransmit && phase != RadioPhase::WaitTxSlot) {
         return "TX";
@@ -298,9 +336,9 @@ static const char* nextActionText(RadioPhase phase, bool pendingTx)
 
     switch (phase) {
     case RadioPhase::WaitSync:
-        return "Need UTC sync";
+        return "UTC";
     case RadioPhase::WaitRxSlot:
-        return "RX";
+        return "Capture";
     case RadioPhase::RxCapture:
         return "Decode";
     case RadioPhase::RxDecode:
@@ -310,7 +348,7 @@ static const char* nextActionText(RadioPhase phase, bool pendingTx)
     case RadioPhase::TxTransmit:
         return "RX";
     case RadioPhase::Error:
-        return "Check serial";
+        return "Serial";
     default:
         return "RX";
     }
@@ -325,7 +363,7 @@ static void setRadioPhase(RadioPhase phase)
     portEXIT_CRITICAL(&appStateMux);
 }
 
-static void addDecodeHistory(const char* text, float snr, float freqHz, bool slotOdd)
+static void addDecodeHistory(const char* text, float snr, float freqHz, bool slotOdd, uint32_t slotEndUtc)
 {
     portENTER_CRITICAL(&appStateMux);
     for (int i = kDecodeHistorySize - 1; i > 0; --i) {
@@ -336,7 +374,7 @@ static void addDecodeHistory(const char* text, float snr, float freqHz, bool slo
     decodeHistory[0].snr = snr;
     decodeHistory[0].freqHz = freqHz;
     decodeHistory[0].slotOdd = slotOdd;
-    decodeHistory[0].utc = static_cast<uint32_t>(time(nullptr));
+    decodeHistory[0].utc = slotEndUtc;
     if (decodeHistoryCount < kDecodeHistorySize) {
         decodeHistoryCount++;
     }
@@ -349,7 +387,7 @@ static void setUiView(UiView view)
 {
     portENTER_CRITICAL(&appStateMux);
     uiView = view;
-    if (view == UiView::History) {
+    if (view == UiView::Message) {
         unreadDecodedCount = 0;
     }
     portEXIT_CRITICAL(&appStateMux);
@@ -364,9 +402,12 @@ static void toggleUiView()
     portENTER_CRITICAL(&appStateMux);
     switch (uiView) {
     case UiView::Home:
-        view = UiView::History;
+        view = UiView::TxSetting;
         break;
-    case UiView::History:
+    case UiView::TxSetting:
+        view = UiView::Message;
+        break;
+    case UiView::Message:
         view = UiView::Waterfall;
         break;
     default:
@@ -374,7 +415,7 @@ static void toggleUiView()
         break;
     }
     uiView = view;
-    if (view == UiView::History) {
+    if (view == UiView::Message) {
         unreadDecodedCount = 0;
     }
     portEXIT_CRITICAL(&appStateMux);
@@ -394,6 +435,15 @@ static bool isUiView(UiView view)
     return matches;
 }
 
+static bool currentViewShowsCommandLine()
+{
+    bool shows;
+    portENTER_CRITICAL(&appStateMux);
+    shows = uiView != UiView::Message && uiView != UiView::Waterfall;
+    portEXIT_CRITICAL(&appStateMux);
+    return shows;
+}
+
 static bool isTxCancelRequested()
 {
     bool cancel;
@@ -401,15 +451,6 @@ static bool isTxCancelRequested()
     cancel = txCancelRequested;
     portEXIT_CRITICAL(&appStateMux);
     return cancel;
-}
-
-static bool isRadioAbortRequested()
-{
-    bool abortRequested;
-    portENTER_CRITICAL(&appStateMux);
-    abortRequested = radioAbortRequested;
-    portEXIT_CRITICAL(&appStateMux);
-    return abortRequested;
 }
 
 static bool isWaterfallCaptureVisible()
@@ -425,13 +466,6 @@ static void clearTxCancelRequest()
 {
     portENTER_CRITICAL(&appStateMux);
     txCancelRequested = false;
-    portEXIT_CRITICAL(&appStateMux);
-}
-
-static void clearRadioAbortRequest()
-{
-    portENTER_CRITICAL(&appStateMux);
-    radioAbortRequested = false;
     portEXIT_CRITICAL(&appStateMux);
 }
 
@@ -455,25 +489,6 @@ static void requestTxCancel()
     } else {
         Serial.println("No TX to cancel");
     }
-    renderStatus(true);
-}
-
-static void toggleFtxProtocol()
-{
-    ftx_protocol_t protocol;
-    portENTER_CRITICAL(&appStateMux);
-    activeProtocol = ftx_protocol_next(activeProtocol);
-    protocol = activeProtocol;
-    txRequested = false;
-    txCancelRequested = true;
-    radioAbortRequested = true;
-    portEXIT_CRITICAL(&appStateMux);
-
-    M5Cardputer.Speaker.stop();
-    if (radioTaskHandle != nullptr) {
-        xTaskNotifyGive(radioTaskHandle);
-    }
-    Serial.printf("Mode switched to %s; RX/TX aborted\n", protocolLabel(protocol));
     renderStatus(true);
 }
 
@@ -514,8 +529,46 @@ static void renderCommandLineUnlocked()
 static void renderCommandLine()
 {
     lockDisplay();
-    renderCommandLineUnlocked();
     unlockDisplay();
+}
+
+static void drawRightText(const char* text, int y, uint8_t textSize, uint16_t color, int minX = 4)
+{
+    int screenW = M5Cardputer.Display.width();
+    int textW = static_cast<int>(strlen(text)) * 6 * textSize;
+    int x = max(minX, screenW - textW - 4);
+    M5Cardputer.Display.setTextSize(textSize);
+    M5Cardputer.Display.setTextColor(color, TFT_BLACK);
+    M5Cardputer.Display.setCursor(x, y);
+    M5Cardputer.Display.printf("%s", text);
+}
+
+static void drawSlotDivider(uint32_t slotEndUtc, int y)
+{
+    char timeText[16];
+    formatUtcTimestamp(slotEndUtc, timeText, sizeof(timeText));
+
+    char label[24];
+    snprintf(label, sizeof(label), "%s end", timeText);
+
+    int screenW = M5Cardputer.Display.width();
+    int labelW = static_cast<int>(strlen(label)) * 6 * kDisplaySmallTextSize;
+    int arrowW = 7;
+    int labelX = max(4, screenW - labelW - arrowW - 6);
+    int lineEndX = max(4, labelX - 4);
+
+    M5Cardputer.Display.setTextSize(kDisplaySmallTextSize);
+    M5Cardputer.Display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    if (lineEndX > 4) {
+        M5Cardputer.Display.drawFastHLine(4, y + 4, lineEndX - 4, TFT_DARKGREY);
+    }
+    M5Cardputer.Display.setCursor(labelX, y);
+    M5Cardputer.Display.printf("%s", label);
+
+    int arrowX = labelX + labelW + 4;
+    int arrowY = y + 2;
+    M5Cardputer.Display.drawLine(arrowX, arrowY, arrowX + 3, arrowY + 4, TFT_DARKGREY);
+    M5Cardputer.Display.drawLine(arrowX + 6, arrowY, arrowX + 3, arrowY + 4, TFT_DARKGREY);
 }
 
 static void renderStatus(bool force = false)
@@ -528,80 +581,132 @@ static void renderStatus(bool force = false)
 
     RadioPhase phase;
     UiView view;
-    ftx_protocol_t protocol;
     bool pendingTx;
     int unreadCount;
     int historyCount;
     int decodedCount;
     DecodeHistoryItem history[kDecodeHistorySize];
-    char pendingMessage[19];
     float toneHz;
+    bool configuredTxSlotOdd;
 
     portENTER_CRITICAL(&appStateMux);
     phase = radioPhase;
     view = uiView;
-    protocol = activeProtocol;
     pendingTx = txRequested;
     unreadCount = unreadDecodedCount;
     historyCount = decodeHistoryCount;
     decodedCount = latestRxDecodedCount;
     memcpy(history, decodeHistory, sizeof(history));
-    strncpy(pendingMessage, txMessage, sizeof(pendingMessage) - 1);
-    pendingMessage[sizeof(pendingMessage) - 1] = '\0';
     toneHz = txToneHz;
+    configuredTxSlotOdd = txSlotOdd;
     portEXIT_CRITICAL(&appStateMux);
 
     char utcText[16];
     formatUtcTime(utcText, sizeof(utcText));
-    int waitSec = secondsToNextSlot(protocol);
+    int waitSec = secondsToNextFt8Slot();
     const bool txMode = phase == RadioPhase::WaitTxSlot || phase == RadioPhase::TxTransmit;
     const bool rxMode = phase == RadioPhase::WaitRxSlot || phase == RadioPhase::RxCapture || phase == RadioPhase::RxDecode;
-    const char* statusText = txMode ? "TX" : (rxMode ? "RX" : "--");
+    const char* statusText = displayPhaseText(phase);
+    char transitionText[32];
+    snprintf(transitionText, sizeof(transitionText), "%s->%s", statusText, displayNextActionText(phase, pendingTx));
+
     lockDisplay();
     int screenW = M5Cardputer.Display.width();
     int statusX = screenW - static_cast<int>(strlen(statusText)) * 12 - 4;
 
     M5Cardputer.Display.fillScreen(TFT_BLACK);
+
+    if (view == UiView::Message) {
+        M5Cardputer.Display.setTextSize(kDisplaySmallTextSize);
+        int y = 4;
+        uint32_t lastSlotEnd = 0;
+        for (int i = 0; i < historyCount && y < M5Cardputer.Display.height() - 4; ++i) {
+            if (i == 0 || history[i].utc != lastSlotEnd) {
+                drawSlotDivider(history[i].utc, y);
+                y += 10;
+                lastSlotEnd = history[i].utc;
+            }
+
+            char shortText[28];
+            strncpy(shortText, history[i].text, sizeof(shortText) - 1);
+            shortText[sizeof(shortText) - 1] = '\0';
+            M5Cardputer.Display.setCursor(4, y);
+            M5Cardputer.Display.setTextColor(i == 0 ? TFT_CYAN : TFT_WHITE, TFT_BLACK);
+            M5Cardputer.Display.printf("%4.0f %+.0f %s", history[i].freqHz, history[i].snr, shortText);
+            y += 11;
+        }
+        if (historyCount == 0) {
+            M5Cardputer.Display.setCursor(4, 4);
+            M5Cardputer.Display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+            M5Cardputer.Display.printf("No RX history");
+        }
+        unlockDisplay();
+        return;
+    }
+
+    if (view == UiView::TxSetting) {
+        M5Cardputer.Display.setTextSize(kDisplayTextSize);
+        M5Cardputer.Display.setTextColor(TFT_CYAN, TFT_BLACK);
+        M5Cardputer.Display.setCursor(4, 4);
+        M5Cardputer.Display.printf("TX Settying");
+        M5Cardputer.Display.drawFastHLine(4, 27, screenW - 8, TFT_DARKGREY);
+
+        M5Cardputer.Display.setTextSize(kDisplaySmallTextSize);
+        M5Cardputer.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+        M5Cardputer.Display.setCursor(4, 35);
+        M5Cardputer.Display.printf("Freq %.0fHz Slot %s", toneHz, configuredTxSlotOdd ? "Odd" : "Even");
+
+        M5Cardputer.Display.drawFastHLine(4, 50, screenW - 8, TFT_DARKGREY);
+        M5Cardputer.Display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        M5Cardputer.Display.setCursor(4, 58);
+        M5Cardputer.Display.printf("Preset standard messages");
+        char presetText[FTX_MAX_MESSAGE_LENGTH];
+        M5Cardputer.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+        formatStandardTxMessage(0, presetText, sizeof(presetText));
+        M5Cardputer.Display.setCursor(4, 72);
+        M5Cardputer.Display.printf("%s", presetText);
+        formatStandardTxMessage(1, presetText, sizeof(presetText));
+        M5Cardputer.Display.setCursor(4, 84);
+        M5Cardputer.Display.printf("%s", presetText);
+        formatStandardTxMessage(2, presetText, sizeof(presetText));
+        M5Cardputer.Display.setCursor(4, 96);
+        M5Cardputer.Display.printf("%s", presetText);
+        renderCommandLineUnlocked();
+        unlockDisplay();
+        return;
+    }
+
     M5Cardputer.Display.setTextColor(TFT_GREEN, TFT_BLACK);
     M5Cardputer.Display.setTextSize(kDisplayTextSize);
     M5Cardputer.Display.setCursor(4, 4);
-    M5Cardputer.Display.printf("%s", protocolLabel(protocol));
+    M5Cardputer.Display.printf("FT8");
     M5Cardputer.Display.setTextColor(txMode ? TFT_RED : (rxMode ? TFT_GREEN : TFT_WHITE), TFT_BLACK);
     M5Cardputer.Display.setCursor(max(52, statusX), 4);
     M5Cardputer.Display.printf("%s", statusText);
     M5Cardputer.Display.drawFastHLine(4, 23, screenW - 8, TFT_DARKGREY);
 
-    M5Cardputer.Display.setTextSize(kDisplaySmallTextSize);
+    M5Cardputer.Display.setTextSize(kDisplayTextSize);
     M5Cardputer.Display.setTextColor(TFT_WHITE, TFT_BLACK);
     M5Cardputer.Display.setCursor(4, 29);
-    M5Cardputer.Display.printf("UTC %s ", utcText);
+    M5Cardputer.Display.printf("UTC %s", utcText);
+    drawRightText(transitionText, 34, kDisplaySmallTextSize, TFT_DARKGREY, 150);
+
+    char slotText[16];
     if (waitSec < 0) {
-        M5Cardputer.Display.printf("Slot --");
+        snprintf(slotText, sizeof(slotText), "Slot --");
     } else {
-        M5Cardputer.Display.printf("%s %02ds", currentSlotIsOdd(protocol) ? "Odd" : "Even", waitSec);
+        snprintf(slotText, sizeof(slotText), "%s %02ds", currentSlotIsOdd() ? "Odd" : "Even", waitSec);
     }
 
-    M5Cardputer.Display.setCursor(4, 43);
-    M5Cardputer.Display.printf("%s -> %s", phaseText(phase), nextActionText(phase, pendingTx));
-    M5Cardputer.Display.drawFastHLine(4, 58, screenW - 8, TFT_DARKGREY);
+    M5Cardputer.Display.setTextSize(kDisplaySmallTextSize);
+    M5Cardputer.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+    int slotTextW = static_cast<int>(strlen(slotText)) * 6 * kDisplaySmallTextSize;
+    M5Cardputer.Display.setCursor(max(4, (screenW - slotTextW) / 2), 48);
+    M5Cardputer.Display.printf("%s", slotText);
 
-    if (view == UiView::History) {
-        M5Cardputer.Display.setTextSize(kDisplaySmallTextSize);
-        int maxLines = min(historyCount, 5);
-        for (int i = 0; i < maxLines; ++i) {
-            char shortText[24];
-            strncpy(shortText, history[i].text, sizeof(shortText) - 1);
-            shortText[sizeof(shortText) - 1] = '\0';
-            M5Cardputer.Display.setCursor(4, 64 + i * 11);
-            M5Cardputer.Display.setTextColor(i == 0 ? TFT_CYAN : TFT_WHITE, TFT_BLACK);
-            M5Cardputer.Display.printf("%4.0f %+.0f %s", history[i].freqHz, history[i].snr, shortText);
-        }
-        if (maxLines == 0) {
-            M5Cardputer.Display.setCursor(4, 64);
-            M5Cardputer.Display.setTextColor(TFT_DARKGREY, TFT_BLACK);
-            M5Cardputer.Display.printf("No RX history");
-        }
-    } else if (view == UiView::Waterfall) {
+    M5Cardputer.Display.drawFastHLine(4, 60, screenW - 8, TFT_DARKGREY);
+
+    if (view == UiView::Waterfall) {
         M5Cardputer.Display.setTextSize(kDisplayTextSize);
         M5Cardputer.Display.setTextColor(TFT_CYAN, TFT_BLACK);
         M5Cardputer.Display.setCursor(4, 64);
@@ -612,17 +717,16 @@ static void renderStatus(bool force = false)
         if (phase == RadioPhase::RxCapture) {
             M5Cardputer.Display.printf("RX capture starting");
         } else {
-            M5Cardputer.Display.printf("Shows during RX");
+            M5Cardputer.Display.printf("Shows during RX capture");
         }
     } else {
         M5Cardputer.Display.setTextSize(kDisplayTextSize);
         M5Cardputer.Display.setTextColor(TFT_WHITE, TFT_BLACK);
         M5Cardputer.Display.setCursor(4, 64);
-        M5Cardputer.Display.printf("TX %.0fHz %s", toneHz, txMode || pendingTx ? "queued" : "ready");
-        M5Cardputer.Display.setCursor(4, 64 + kDisplayLineHeight);
-        M5Cardputer.Display.printf("%s", pendingMessage);
-        M5Cardputer.Display.setTextSize(kDisplaySmallTextSize);
-        M5Cardputer.Display.setCursor(4, 102);
+        M5Cardputer.Display.printf("TX:");
+        M5Cardputer.Display.drawFastHLine(4, 88, screenW - 8, TFT_DARKGREY);
+        M5Cardputer.Display.setTextSize(kDisplayTextSize);
+        M5Cardputer.Display.setCursor(4, 97);
         if (unreadCount > 0) {
             M5Cardputer.Display.setTextColor(TFT_CYAN, TFT_BLACK);
             M5Cardputer.Display.printf("RX new %d total %d", unreadCount, decodedCount);
@@ -634,7 +738,9 @@ static void renderStatus(bool force = false)
             M5Cardputer.Display.printf("RX listening");
         }
     }
-    renderCommandLineUnlocked();
+    if (view != UiView::Message && view != UiView::Waterfall) {
+        renderCommandLineUnlocked();
+    }
     unlockDisplay();
 }
 
@@ -769,7 +875,6 @@ static void renderRxWaterfall(const monitor_t& monitor)
         normalized = normalized < 0 ? 0 : (normalized > 255 ? 255 : normalized);
         display.fillRect(left + x, y0, 1, rowH, waterfallColor(static_cast<uint8_t>(normalized)));
     }
-    renderCommandLineUnlocked();
     unlockDisplay();
 }
 
@@ -834,7 +939,7 @@ static bool syncTime(uint32_t timeoutMs = 15000)
     return true;
 }
 
-static bool waitForNextSlot(ftx_protocol_t protocol, bool abortOnTxRequest = false)
+static bool waitForFt8Slot(bool abortOnTxRequest = false)
 {
     if (!timeIsSynced()) {
         Serial.println("Time is not synced. Use: set SSID ..., set PASS ..., then sync");
@@ -844,22 +949,16 @@ static bool waitForNextSlot(ftx_protocol_t protocol, bool abortOnTxRequest = fal
 
     struct timeval tvStart;
     gettimeofday(&tvStart, nullptr);
-    int64_t startUs = (static_cast<int64_t>(tvStart.tv_sec) * 1000000LL) + tvStart.tv_usec;
-    int64_t periodUs = protocolSlotPeriodUs(protocol);
-    int64_t targetUs = ((startUs / periodUs) + 1) * periodUs;
-    int waitSec = static_cast<int>((targetUs - startUs + 999999LL) / 1000000LL);
-    Serial.printf("Waiting for next %s slot: %d s\n", protocolLabel(protocol), waitSec);
+    time_t target = ((tvStart.tv_sec / 15) + 1) * 15;
+    int waitSec = static_cast<int>(target - tvStart.tv_sec);
+    Serial.printf("Waiting for next FT8 slot: %d s\n", waitSec);
 
     while (true) {
         struct timeval tv;
         gettimeofday(&tv, nullptr);
-        int64_t nowUs = (static_cast<int64_t>(tv.tv_sec) * 1000000LL) + tv.tv_usec;
-        int64_t remainingUs = targetUs - nowUs;
+        int64_t remainingUs = (static_cast<int64_t>(target - tv.tv_sec) * 1000000LL) - tv.tv_usec;
         if (remainingUs <= 0) {
             break;
-        }
-        if (isRadioAbortRequested()) {
-            return false;
         }
         if (!abortOnTxRequest && isTxCancelRequested()) {
             return false;
@@ -933,7 +1032,7 @@ static void stopMicAndRestoreSpeaker()
     M5Cardputer.Speaker.end();
 }
 
-static void decodeWaterfall(const monitor_t& monitor, ftx_protocol_t protocol, bool slotOdd)
+static void decodeWaterfall(const monitor_t& monitor, bool slotOdd, uint32_t slotEndUtc)
 {
     const ftx_waterfall_t* wf = &monitor.wf;
     ftx_candidate_t* candidateList = static_cast<ftx_candidate_t*>(
@@ -956,10 +1055,6 @@ static void decodeWaterfall(const monitor_t& monitor, ftx_protocol_t protocol, b
 
     Serial.printf("RX candidates: %d, max_mag=%.1f dB\n", numCandidates, monitor.max_mag);
     for (int idx = 0; idx < numCandidates; ++idx) {
-        if (isRadioAbortRequested()) {
-            Serial.println("RX decode aborted");
-            break;
-        }
         const ftx_candidate_t* candidate = &candidateList[idx];
         ftx_message_t message;
         ftx_decode_status_t status = {};
@@ -1007,9 +1102,8 @@ static void decodeWaterfall(const monitor_t& monitor, ftx_protocol_t protocol, b
             snprintf(text, sizeof(text), "unpack error %d", static_cast<int>(unpack));
         }
 
-        Serial.printf("%s %+05.1f dB %+4.2f s %4.0f Hz ~ %s\n",
-            protocolLabel(protocol), snr, timeSec, freqHz, text);
-        addDecodeHistory(text, snr, freqHz, slotOdd);
+        Serial.printf("FT8 %+05.1f dB %+4.2f s %4.0f Hz ~ %s\n", snr, timeSec, freqHz, text);
+        addDecodeHistory(text, snr, freqHz, slotOdd, slotEndUtc);
     }
 
     Serial.printf("RX decoded: %d, callsign hashes: %d\n", numDecoded, callsignHashtableSize);
@@ -1020,15 +1114,13 @@ static void decodeWaterfall(const monitor_t& monitor, ftx_protocol_t protocol, b
     free(candidateList);
 }
 
-static void runDecodeWaterfall(const monitor_t& monitor, ftx_protocol_t protocol, bool slotOdd)
+static void runDecodeWaterfall(const monitor_t& monitor, bool slotOdd, uint32_t slotEndUtc)
 {
-    decodeWaterfall(monitor, protocol, slotOdd);
+    decodeWaterfall(monitor, slotOdd, slotEndUtc);
 }
 
 static bool receiveOnce()
 {
-    ftx_protocol_t protocol = currentProtocol();
-    const ftx_protocol_info_t* info = protocolInfo(protocol);
     if (!timeIsSynced()) {
         Serial.println("Time is not synced. Use: set SSID ..., set PASS ..., then sync");
         renderStatus(true);
@@ -1044,15 +1136,14 @@ static bool receiveOnce()
     config.sample_rate = kAudioSampleRate;
     config.time_osr = kTimeOsr;
     config.freq_osr = kFreqOsr;
-    config.protocol = protocol;
+    config.protocol = FTX_PROTOCOL_FT8;
 
-    float symbolPeriod = info->symbol_period;
-    int maxBlocks = static_cast<int>(info->slot_time / symbolPeriod);
-    int minBin = static_cast<int>(config.f_min * symbolPeriod);
-    int maxBin = static_cast<int>(config.f_max * symbolPeriod) + 1;
+    int maxBlocks = static_cast<int>(FT8_SLOT_TIME / FT8_SYMBOL_PERIOD);
+    int minBin = static_cast<int>(config.f_min * FT8_SYMBOL_PERIOD);
+    int maxBin = static_cast<int>(config.f_max * FT8_SYMBOL_PERIOD) + 1;
     int numBins = maxBin - minBin;
     size_t waterfallBytes = static_cast<size_t>(maxBlocks) * config.time_osr * config.freq_osr * numBins;
-    size_t fftBytes = static_cast<size_t>(config.sample_rate * symbolPeriod * config.freq_osr) *
+    size_t fftBytes = static_cast<size_t>(config.sample_rate * FT8_SYMBOL_PERIOD * config.freq_osr) *
         (sizeof(float) * 3 + sizeof(kiss_fft_cpx));
     Serial.printf("RX alloc estimate: waterfall=%u, fft~= %u, heap=%u\n",
         static_cast<unsigned>(waterfallBytes),
@@ -1086,45 +1177,22 @@ static bool receiveOnce()
         return false;
     }
 
-    int16_t* rxPcm = static_cast<int16_t*>(appHeapMalloc(sizeof(int16_t) * monitor.block_size));
-    float* rxFrame = static_cast<float*>(appHeapMalloc(sizeof(float) * monitor.block_size));
-    if (rxPcm == nullptr || rxFrame == nullptr) {
-        Serial.println("RX audio buffer allocation failed");
-        free(rxFrame);
-        free(rxPcm);
-        monitor_free(&monitor);
-        stopMicAndRestoreSpeaker();
-        setRadioPhase(RadioPhase::Error);
-        return false;
-    }
-
-    if (!waitForNextSlot(protocol, true)) {
-        bool aborted = isRadioAbortRequested();
-        free(rxFrame);
-        free(rxPcm);
+    if (!waitForFt8Slot(true)) {
         stopMicAndRestoreSpeaker();
         monitor_free(&monitor);
-        setRadioPhase(timeIsSynced() ? (aborted ? RadioPhase::WaitRxSlot : RadioPhase::WaitTxSlot) : RadioPhase::WaitSync);
+        setRadioPhase(timeIsSynced() ? RadioPhase::WaitTxSlot : RadioPhase::WaitSync);
         return false;
     }
     setRadioPhase(RadioPhase::RxCapture);
-    bool captureSlotOdd = currentSlotIsOdd(protocol);
+    bool captureSlotOdd = currentSlotIsOdd();
+    uint32_t captureSlotEndUtc = static_cast<uint32_t>(((time(nullptr) / 15) + 1) * 15);
 
-    Serial.printf("%s RX capture start\n", protocolLabel(protocol));
+    Serial.println("RX capture start");
     rxPeak = 0;
     rxAbsSum = 0;
     rxSampleTotal = 0;
 
     while (monitor.wf.num_blocks < monitor.wf.max_blocks) {
-        if (isRadioAbortRequested()) {
-            Serial.println("RX aborted");
-            free(rxFrame);
-            free(rxPcm);
-            stopMicAndRestoreSpeaker();
-            monitor_free(&monitor);
-            setRadioPhase(RadioPhase::WaitRxSlot);
-            return false;
-        }
         if (!M5Cardputer.Mic.record(rxPcm, monitor.block_size, kAudioSampleRate, false)) {
             delay(1);
             continue;
@@ -1155,18 +1223,9 @@ static bool receiveOnce()
         static_cast<long>(rxPeak),
         static_cast<unsigned long>(rxSampleTotal ? rxAbsSum / rxSampleTotal : 0),
         static_cast<unsigned long>(rxSampleTotal));
-    portENTER_CRITICAL(&appStateMux);
-    latestRxPeak = rxPeak;
-    latestRxAvgAbs = rxSampleTotal ? static_cast<uint32_t>(rxAbsSum / rxSampleTotal) : 0;
-    portEXIT_CRITICAL(&appStateMux);
-
     stopMicAndRestoreSpeaker();
     setRadioPhase(RadioPhase::RxDecode);
-    if (!isRadioAbortRequested()) {
-        runDecodeWaterfall(monitor, protocol, captureSlotOdd);
-    }
-    free(rxFrame);
-    free(rxPcm);
+    runDecodeWaterfall(monitor, captureSlotOdd, captureSlotEndUtc);
     monitor_free(&monitor);
 
     setRadioPhase(RadioPhase::WaitRxSlot);
@@ -1176,15 +1235,15 @@ static bool receiveOnce()
 static float gfskPulseValue(int index, int samplesPerSymbol)
 {
     float t = index / static_cast<float>(samplesPerSymbol) - 1.5f;
-    float arg1 = kGfskConstK * kFtxSymbolBt * (t + 0.5f);
-    float arg2 = kGfskConstK * kFtxSymbolBt * (t - 0.5f);
+    float arg1 = kGfskConstK * kFt8SymbolBt * (t + 0.5f);
+    float arg2 = kGfskConstK * kFt8SymbolBt * (t - 0.5f);
     return (erff(arg1) - erff(arg2)) * 0.5f;
 }
 
-static int16_t synthSample(const uint8_t* tones, int numSymbols, float symbolPeriod,
-    int sampleIndex, float baseToneHz, float& phase)
+static int16_t synthSample(const uint8_t* tones, int sampleIndex, float baseToneHz, float& phase)
 {
-    int samplesPerSymbol = static_cast<int>(0.5f + kAudioSampleRate * symbolPeriod);
+    constexpr int numSymbols = FT8_NN;
+    int samplesPerSymbol = static_cast<int>(0.5f + kAudioSampleRate * FT8_SYMBOL_PERIOD);
     int waveSamples = numSymbols * samplesPerSymbol;
     float dphi = 2.0f * static_cast<float>(M_PI) * baseToneHz / kAudioSampleRate;
     float dphiPeak = 2.0f * static_cast<float>(M_PI) / samplesPerSymbol;
@@ -1239,7 +1298,7 @@ static bool writeSilenceSamples(int sampleCount, bool abortOnTxCancel = false)
     int16_t silence[kSpeakerChunkSamples] = {};
     bool first = false;
     while (sampleCount > 0) {
-        if (abortOnTxCancel && (isTxCancelRequested() || isRadioAbortRequested())) {
+        if (abortOnTxCancel && isTxCancelRequested()) {
             return false;
         }
         int count = min(sampleCount, kSpeakerChunkSamples);
@@ -1280,9 +1339,8 @@ static void playTestTone(float frequencyHz, int durationMs)
     Serial.println("Test tone done");
 }
 
-static bool transmitFtx(ftx_protocol_t protocol, const char* text, float baseToneHz, bool waitForSlot)
+static bool transmitFt8(const char* text, float baseToneHz, bool waitForSlot)
 {
-    const ftx_protocol_info_t* info = protocolInfo(protocol);
     ftx_message_t message;
     ftx_message_rc_t rc = ftx_message_encode(&message, &hashIf, text);
     if (rc != FTX_MESSAGE_RC_OK) {
@@ -1291,29 +1349,17 @@ static bool transmitFtx(ftx_protocol_t protocol, const char* text, float baseTon
         return false;
     }
 
-    int numSymbols = info->num_symbols;
-    uint8_t* tones = static_cast<uint8_t*>(appHeapMalloc(numSymbols));
-    if (tones == nullptr) {
-        Serial.println("TX tone buffer allocation failed");
-        renderStatus(true);
-        return false;
-    }
-    float symbolPeriod = info->symbol_period;
-    if (!ftx_encode(protocol, message.payload, tones)) {
-        Serial.printf("TX protocol unsupported: %s\n", protocolLabel(protocol));
-        free(tones);
-        renderStatus(true);
-        return false;
-    }
+    uint8_t tones[FT8_NN];
+    ft8_encode(message.payload, tones);
 
-    int samplesPerSymbol = static_cast<int>(0.5f + kAudioSampleRate * symbolPeriod);
-    int waveSamples = numSymbols * samplesPerSymbol;
-    int slotSamples = static_cast<int>(info->slot_time * kAudioSampleRate);
+    int samplesPerSymbol = static_cast<int>(0.5f + kAudioSampleRate * FT8_SYMBOL_PERIOD);
+    int waveSamples = FT8_NN * samplesPerSymbol;
+    int slotSamples = static_cast<int>(FT8_SLOT_TIME * kAudioSampleRate);
     int silenceSamples = max(0, (slotSamples - waveSamples) / 2);
 
-    Serial.printf("Encoding %s: %s\n", protocolLabel(protocol), text);
+    Serial.printf("Encoding FT8: %s\n", text);
     Serial.print("Tones: ");
-    for (int i = 0; i < numSymbols; ++i) {
+    for (int i = 0; i < FT8_NN; ++i) {
         Serial.print(tones[i]);
     }
     Serial.println();
@@ -1321,15 +1367,14 @@ static bool transmitFtx(ftx_protocol_t protocol, const char* text, float baseTon
 
     setRadioPhase(waitForSlot ? RadioPhase::WaitTxSlot : RadioPhase::TxTransmit);
 
-    if (waitForSlot && !waitForNextSlot(protocol)) {
-        if (isTxCancelRequested() || isRadioAbortRequested()) {
+    if (waitForSlot && !waitForFt8Slot()) {
+        if (isTxCancelRequested()) {
             Serial.println("TX cancelled before slot");
             clearTxCancelRequest();
             setRadioPhase(RadioPhase::WaitRxSlot);
         } else {
             setRadioPhase(RadioPhase::WaitSync);
         }
-        free(tones);
         return false;
     }
 
@@ -1341,7 +1386,6 @@ static bool transmitFtx(ftx_protocol_t protocol, const char* text, float baseTon
         M5Cardputer.Speaker.end();
         clearTxCancelRequest();
         setRadioPhase(RadioPhase::WaitRxSlot);
-        free(tones);
         return false;
     }
 
@@ -1349,17 +1393,16 @@ static bool transmitFtx(ftx_protocol_t protocol, const char* text, float baseTon
     float phase = 0.0f;
     int sampleIndex = 0;
     while (sampleIndex < waveSamples) {
-        if (isTxCancelRequested() || isRadioAbortRequested()) {
+        if (isTxCancelRequested()) {
             M5Cardputer.Speaker.stop();
             M5Cardputer.Speaker.end();
             clearTxCancelRequest();
             setRadioPhase(RadioPhase::WaitRxSlot);
-            free(tones);
             return false;
         }
         int count = min(kSpeakerChunkSamples, waveSamples - sampleIndex);
         for (int i = 0; i < count; ++i) {
-            chunk[i] = synthSample(tones, numSymbols, symbolPeriod, sampleIndex + i, baseToneHz, phase);
+            chunk[i] = synthSample(tones, sampleIndex + i, baseToneHz, phase);
         }
 
         speakerPlayChunk(chunk, count);
@@ -1371,16 +1414,14 @@ static bool transmitFtx(ftx_protocol_t protocol, const char* text, float baseTon
         M5Cardputer.Speaker.end();
         clearTxCancelRequest();
         setRadioPhase(RadioPhase::WaitRxSlot);
-        free(tones);
         return false;
     }
     while (M5Cardputer.Speaker.isPlaying(kSpeakerChannel)) {
-        if (isTxCancelRequested() || isRadioAbortRequested()) {
+        if (isTxCancelRequested()) {
             M5Cardputer.Speaker.stop();
             M5Cardputer.Speaker.end();
             clearTxCancelRequest();
             setRadioPhase(RadioPhase::WaitRxSlot);
-            free(tones);
             return false;
         }
         delay(1);
@@ -1389,7 +1430,6 @@ static bool transmitFtx(ftx_protocol_t protocol, const char* text, float baseTon
     M5Cardputer.Speaker.end();
     clearTxCancelRequest();
     setRadioPhase(RadioPhase::WaitRxSlot);
-    free(tones);
     return true;
 }
 
@@ -1466,28 +1506,9 @@ static String readKeyboardLine()
     if (escapePressed) {
         keyboardCommand = "";
         requestTxCancel();
-        renderCommandLine();
-        return String();
-    }
-
-    bool fnModePressed = false;
-    if (status.fn) {
-        for (uint8_t hid : status.hid_keys) {
-            if (hid == kHidKeyM) {
-                fnModePressed = true;
-                break;
-            }
+        if (currentViewShowsCommandLine()) {
+            renderCommandLine();
         }
-        for (char ch : status.word) {
-            if (ch == 'm' || ch == 'M') {
-                fnModePressed = true;
-                break;
-            }
-        }
-    }
-    if (fnModePressed) {
-        keyboardCommand = "";
-        toggleFtxProtocol();
         return String();
     }
 
@@ -1533,10 +1554,12 @@ static String readKeyboardLine()
         String out = keyboardCommand;
         out.trim();
         keyboardCommand = "";
-        renderCommandLine();
+        if (currentViewShowsCommandLine()) {
+            renderCommandLine();
+        }
         return out;
     }
-    if (changed) {
+    if (changed && currentViewShowsCommandLine()) {
         renderCommandLine();
     }
     return String();
@@ -1545,18 +1568,19 @@ static String readKeyboardLine()
 static void printCommandHelp()
 {
     Serial.println("CardFTx commands:");
-    Serial.println("  mode toggles FT8/FT4");
     Serial.println("  set freq 1000");
-    Serial.println("  set msg CQ BG6WRI ON80");
+    Serial.println("  set slot odd|even");
+    char defaultText[FTX_MAX_MESSAGE_LENGTH];
+    formatStandardTxMessage(0, defaultText, sizeof(defaultText));
+    Serial.printf("  set msg %s\n", defaultText);
     Serial.println("  set SSID your_wifi_name");
     Serial.println("  set PASS your_wifi_password");
     Serial.println("  sync");
     Serial.println("  tx");
     Serial.println("  esc cancels queued/current TX");
-    Serial.println("  home | history | waterfall");
+    Serial.println("  home | txset | message | waterfall");
     Serial.println("  show");
-    Serial.println("  / cycles home/history/waterfall on the keyboard");
-    Serial.println("  Fn+M toggles FT8/FT4 on the keyboard");
+    Serial.println("  / cycles home/txset/message/waterfall on the keyboard");
 }
 
 static void requestTxNextSlot()
@@ -1570,14 +1594,37 @@ static void requestTxNextSlot()
     }
 }
 
+static bool setTxSlotParity(const String& value)
+{
+    String lower = value;
+    lower.trim();
+    lower.toLowerCase();
+
+    if (lower == "odd") {
+        portENTER_CRITICAL(&appStateMux);
+        txSlotOdd = true;
+        portEXIT_CRITICAL(&appStateMux);
+        Serial.println("TX slot set: Odd");
+        return true;
+    }
+    if (lower == "even") {
+        portENTER_CRITICAL(&appStateMux);
+        txSlotOdd = false;
+        portEXIT_CRITICAL(&appStateMux);
+        Serial.println("TX slot set: Even");
+        return true;
+    }
+
+    Serial.println("TX slot must be odd or even");
+    return false;
+}
+
 static void radioTask(void*)
 {
     char txText[FTX_MAX_MESSAGE_LENGTH];
-    float toneHz = kFt8DefaultToneHz;
-    ftx_protocol_t txProtocol = FTX_PROTOCOL_FT8;
+    float toneHz = kFtxDefaultToneHz;
 
     while (true) {
-        clearRadioAbortRequest();
         if (!timeIsSynced()) {
             setRadioPhase(RadioPhase::WaitSync);
             ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(250));
@@ -1592,12 +1639,11 @@ static void radioTask(void*)
             strncpy(txText, txMessage, sizeof(txText) - 1);
             txText[sizeof(txText) - 1] = '\0';
             toneHz = txToneHz;
-            txProtocol = activeProtocol;
         }
         portEXIT_CRITICAL(&appStateMux);
 
         if (shouldTx) {
-            transmitFtx(txProtocol, txText, toneHz, true);
+            transmitFt8(txText, toneHz, true);
             continue;
         }
 
@@ -1637,6 +1683,10 @@ static void handleCommand(const String& input)
             Serial.printf("TX audio frequency=%.1f Hz\n", txToneHz);
             renderStatus(true);
         }
+    } else if (lower.startsWith("set slot ")) {
+        if (setTxSlotParity(line.substring(9))) {
+            renderStatus(true);
+        }
     } else if (lower.startsWith("set ssid ")) {
         String value = line.substring(9);
         value.trim();
@@ -1650,35 +1700,21 @@ static void handleCommand(const String& input)
         Serial.println("WiFi password set");
         renderStatus(true);
     } else if (lower == "show") {
-        char utcText[16];
-        formatUtcTime(utcText, sizeof(utcText));
         char messageCopy[FTX_MAX_MESSAGE_LENGTH];
-        float toneCopy;
         bool pendingTx;
         RadioPhase phase;
-        ftx_protocol_t protocol;
         portENTER_CRITICAL(&appStateMux);
         strncpy(messageCopy, txMessage, sizeof(messageCopy) - 1);
         messageCopy[sizeof(messageCopy) - 1] = '\0';
-        toneCopy = txToneHz;
         pendingTx = txRequested;
         phase = radioPhase;
-        protocol = activeProtocol;
         portEXIT_CRITICAL(&appStateMux);
-        Serial.printf("Protocol: %s, radio=%s, TX queued=%s\n",
-            protocolLabel(protocol), phaseText(phase), pendingTx ? "yes" : "no");
-        Serial.printf("Message: %s\n", messageCopy);
-        Serial.printf("TX audio frequency: %.1f Hz\n", toneCopy);
-        Serial.printf("WiFi SSID: %s\n", wifiSsid);
-        Serial.printf("UTC: %s, synced=%s\n", utcText, timeIsSynced() ? "yes" : "no");
-        Serial.printf("WiFi: %s\n", WiFi.status() == WL_CONNECTED ? "connected" : "disconnected");
+        Serial.printf("FT8 %s TX=%s\n", displayPhaseText(phase), pendingTx ? "queued" : "idle");
+        Serial.printf("%s\n", messageCopy);
         renderStatus(true);
-    } else if (lower == "mode") {
-        toggleFtxProtocol();
     } else if (lower == "tx") {
-        ftx_protocol_t protocol = currentProtocol();
         requestTxNextSlot();
-        Serial.printf("TX queued for the next %s slot\n", protocolLabel(protocol));
+        Serial.println("TX queued for the next FT8 slot");
         renderStatus(true);
     } else if (lower == "esc" || lower == "cancel" || lower == "stop") {
         requestTxCancel();
@@ -1687,8 +1723,11 @@ static void handleCommand(const String& input)
     } else if (lower == "home") {
         setUiView(UiView::Home);
         renderStatus(true);
-    } else if (lower == "history" || lower == "hist") {
-        setUiView(UiView::History);
+    } else if (lower == "txset" || lower == "tx setting" || lower == "txsetting") {
+        setUiView(UiView::TxSetting);
+        renderStatus(true);
+    } else if (lower == "message" || lower == "msg" || lower == "history" || lower == "hist") {
+        setUiView(UiView::Message);
         renderStatus(true);
     } else if (lower == "waterfall" || lower == "wf") {
         setUiView(UiView::Waterfall);
@@ -1710,6 +1749,7 @@ bool ft8AppBegin()
     wifiSsid[sizeof(wifiSsid) - 1] = '\0';
     strncpy(wifiPassword, kDefaultWifiPassword, sizeof(wifiPassword) - 1);
     wifiPassword[sizeof(wifiPassword) - 1] = '\0';
+    formatStandardTxMessage(0, txMessage, sizeof(txMessage));
 
     displayMutex = xSemaphoreCreateMutex();
     if (displayMutex == nullptr) {

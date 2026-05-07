@@ -26,51 +26,6 @@ const uint8_t kFT4_XOR_sequence[10] = {
     0x28u, // 00101 [000]
 };
 
-static const ftx_protocol_info_t kFtxProtocolInfo[] = {
-    {
-        FTX_PROTOCOL_FT8,
-        "FT8",
-        FT8_SYMBOL_PERIOD,
-        FT8_SLOT_TIME,
-        FT8_NN,
-        8,
-        2.0f,
-        3.2f,
-    },
-    {
-        FTX_PROTOCOL_FT4,
-        "FT4",
-        FT4_SYMBOL_PERIOD,
-        FT4_SLOT_TIME,
-        FT4_NN,
-        4,
-        2.0f,
-        3.2f,
-    },
-};
-
-static const int kFtxProtocolInfoCount = sizeof(kFtxProtocolInfo) / sizeof(kFtxProtocolInfo[0]);
-
-const ftx_protocol_info_t* ftx_protocol_info(ftx_protocol_t protocol)
-{
-    for (int i = 0; i < kFtxProtocolInfoCount; ++i)
-    {
-        if (kFtxProtocolInfo[i].protocol == protocol)
-            return &kFtxProtocolInfo[i];
-    }
-    return &kFtxProtocolInfo[0];
-}
-
-ftx_protocol_t ftx_protocol_next(ftx_protocol_t protocol)
-{
-    for (int i = 0; i < kFtxProtocolInfoCount; ++i)
-    {
-        if (kFtxProtocolInfo[i].protocol == protocol)
-            return kFtxProtocolInfo[(i + 1) % kFtxProtocolInfoCount].protocol;
-    }
-    return kFtxProtocolInfo[0].protocol;
-}
-
 // Parity generator matrix for (174,91) LDPC code, stored in bitpacked format (MSB first)
 const uint8_t kFTX_LDPC_generator[FTX_LDPC_M][FTX_LDPC_K_BYTES] = {
     { 0x83, 0x29, 0xce, 0x11, 0xbf, 0x31, 0xea, 0xf5, 0x09, 0xf2, 0x7f, 0xc0 },

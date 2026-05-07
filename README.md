@@ -16,12 +16,13 @@ A FT4/FT8 codec on Cardputer.
 
 ## Mode
 
-- FT8, FT4
+- FT8  
 
 ## Usage
 
 - **ESC**: Abort the current task  
 - **Fn + M**: Switch modulation/demodulation mode  
+- **/**: Change Home/Message/Waterfall
 
 ## Acknowledgements
 

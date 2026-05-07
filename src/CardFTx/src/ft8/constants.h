@@ -55,18 +55,6 @@ typedef enum
     FTX_PROTOCOL_FT8
 } ftx_protocol_t;
 
-typedef struct
-{
-    ftx_protocol_t protocol;
-    const char* label;
-    float symbol_period;
-    float slot_time;
-    uint16_t num_symbols;
-    uint8_t num_tones;
-    float candidate_search_before_sec;
-    float candidate_search_after_sec;
-} ftx_protocol_info_t;
-
 /// Costas 7x7 tone pattern for synchronization
 extern const uint8_t kFT8_Costas_pattern[7];
 extern const uint8_t kFT4_Costas_pattern[4][4];
@@ -94,9 +82,6 @@ extern const uint8_t kFTX_LDPC_Mn[FTX_LDPC_N][3];
 
 /// Number of rows (columns in C/C++) in the array Nm.
 extern const uint8_t kFTX_LDPC_Num_rows[FTX_LDPC_M];
-
-const ftx_protocol_info_t* ftx_protocol_info(ftx_protocol_t protocol);
-ftx_protocol_t ftx_protocol_next(ftx_protocol_t protocol);
 
 #ifdef __cplusplus
 }

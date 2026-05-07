@@ -28,20 +28,21 @@ Open Serial Monitor at `115200`, or type the same commands on the Cardputer keyb
 - `set SSID your_wifi_name` sets the Wi-Fi SSID.
 - `set PASS your_wifi_password` sets the Wi-Fi password.
 - `sync` connects Wi-Fi with the current SSID/PASS and runs NTP sync.
-- `mode` toggles between FT8 and FT4. Switching mode aborts any current RX/TX work before the radio task restarts in the new mode.
-- `set msg CQ TEST AB12` edits the stored FTx message and validates it locally.
-- `set freq 1000` sets the FTx base audio tone in Hz.
-- `tx` queues the stored message for the next UTC FT8/FT4 boundary. After TX, the radio task returns to continuous RX.
+- `set msg CQ TEST AB12` edits the stored FT8 message and validates it locally.
+- `set freq 1000` sets the FT8 base audio tone in Hz.
+- `set slot odd` or `set slot even` sets the configured TX slot parity for future Auto TX.
+- `tx` queues the stored message for the next UTC 15 second FT8 boundary. After TX, the radio task returns to continuous RX.
 - `esc`, `cancel`, or `stop` cancels queued TX or stops the current TX.
 - `rx` or `rx once` is retained as a harmless status command; continuous RX is already running by default.
 - `home` shows the live dashboard.
-- `history` shows recent decoded messages.
+- `txset`, `tx setting`, or `txsetting` shows TX settings.
+- `message`, `msg`, `history`, or `hist` shows recent decoded messages.
 - `waterfall` or `wf` shows the live RX waterfall during capture.
-- On the Cardputer keyboard, `/` cycles through home, history, and waterfall. `Fn+M` toggles FT8/FT4. ESC cancels queued/current TX.
-- `show` prints the stored message, frequency, Wi-Fi state, and UTC sync state.
+- On the Cardputer keyboard, `/` cycles through home, TX Setting, Message, and waterfall. ESC cancels queued/current TX.
+- `show` prints one status line followed by the stored message.
 - `help` prints the command list.
 
-The receiver starts automatically after boot once UTC time is synced. It captures an FT8 or FT4 window at 12 kHz with `M5Cardputer.Mic` and prints decoded candidates:
+The receiver starts automatically after boot once UTC time is synced. It captures an FT8 window at 12 kHz with `M5Cardputer.Mic` and prints decoded candidates:
 
 ```text
 FT8 +12.5 dB +0.80 s 1000 Hz ~ CQ TEST AB12
@@ -51,14 +52,16 @@ FT8 +12.5 dB +0.80 s 1000 Hz ~ CQ TEST AB12
 
 The TX path uses `M5Cardputer.Speaker` and schedules playback on UTC 00/15/30/45 second boundaries after NTP sync. RX uses `M5Cardputer.Mic`, so speaker playback and microphone capture are switched rather than used simultaneously.
 
+Standard TX messages are generated from `kFtxStationCallsign`, `kFtxStationGrid`, and `kFtxDefaultReport` in `src/config.h`.
+
 ## Runtime Design
 
-CardFTx now treats RX as the default operating mode. Single-shot RX/TX commands are avoided in the main UI path: the radio task continuously waits for the next FT8 or FT4 slot, captures RX audio, decodes, and loops. The `tx` command only marks the current stored message as pending for the next slot; the radio task performs the scheduled TX and then goes back to RX.
+CardFTx now treats RX as the default operating mode. Single-shot RX/TX commands are avoided in the main UI path: the radio task continuously waits for the next FT8 slot, captures RX audio, decodes, and loops. The `tx` command only marks the current stored message as pending for the next slot; the radio task performs the scheduled TX and then goes back to RX.
 
 The task split is intentionally simple:
 
 - Arduino `loop()` remains on the UI side. It calls `M5Cardputer.update()`, reads the keyboard/serial command line, and redraws the screen once per second.
-- `ft8Radio` is pinned to core 0. It owns microphone capture, FT8/FT4 decode, scheduled speaker TX, and audio device switching.
+- `ft8Radio` is pinned to core 0. It owns microphone capture, FT8 decode, scheduled speaker TX, and audio device switching.
 - Shared state is copied through a small critical section. The radio task only draws directly while the waterfall view is visible during RX capture.
 
 ## Screen Design
@@ -67,20 +70,21 @@ The home screen is a compact dashboard rather than a full waterfall:
 
 ```text
 FT8                         RX
-UTC 12:34:08 Odd 07s
-RX -> Decode
+UTC 12:34:08          RX->Decode
+Odd 07s
 
-TX 1000Hz ready
-CQ BG6WRI ON80
-RX new 2 total 5 AF 1830/214
+TX:
+
+----------------------
+RX new 2 total 5
 >command
 ```
 
-- The top-left protocol label is `FT8` or `FT4`; use `Fn+M` or the `mode` command to switch.
-- The top-right mode is `RX` in green or `TX` in red.
-- The second line shows UTC, current slot parity, and countdown to the next protocol boundary.
-- The third line shows the current action and predicted next action.
-- The TX area shows the stored outgoing message and whether it is queued.
-- The RX area only says whether new messages arrived. Detailed decoded text stays off the home screen.
+- The top-left protocol label is `FT8`; `FT4` is reserved for future support.
+- The top-right status matches the current status shown on the UTC row.
+- The UTC time is enlarged; slot parity and countdown sit below it.
+- The UTC row also shows the current action and predicted next action on the right.
+- The TX area only shows `TX:` on Home; TX details live on the TX Setting page.
+- The RX area is separated from TX and uses larger text for received/new/listening state.
 
-Press `/` to cycle Home -> History -> Waterfall. The history screen shows the newest decoded lines first with audio frequency, estimated SNR, and a shortened message. Opening history clears the unread count. The waterfall screen draws the live RX waterfall while a capture is in progress and otherwise shows a waiting/status panel.
+Press `/` to cycle Home -> TX Setting -> Message -> Waterfall. The TX Setting page shows the transmit frequency, configured TX slot parity, and preset standard messages for future Auto mode. The Message page uses the full screen for the newest decoded lines, without the Home header, UTC band, or bottom command line. Each decoded slot starts with a divider whose right side shows that slot's UTC end timestamp and a drawn arrow. Opening Message clears the unread count. The waterfall screen draws the live RX waterfall while a capture is in progress and does not show the bottom command line.

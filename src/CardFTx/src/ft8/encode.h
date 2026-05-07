@@ -1,10 +1,7 @@
 #ifndef _INCLUDE_ENCODE_H_
 #define _INCLUDE_ENCODE_H_
 
-#include <stdbool.h>
 #include <stdint.h>
-
-#include "constants.h"
 
 #ifdef __cplusplus
 extern "C"
@@ -36,10 +33,6 @@ void ft8_encode(const uint8_t* payload, uint8_t* tones);
 /// @param[in] payload - 10 byte array consisting of 77 bit payload
 /// @param[out] tones  - array of FT4_NN (105) bytes to store the generated tones (encoded as 0..3)
 void ft4_encode(const uint8_t* payload, uint8_t* tones);
-
-/// Generate tone sequence from payload data for the selected protocol.
-/// @return true when the protocol is supported.
-bool ftx_encode(ftx_protocol_t protocol, const uint8_t* payload, uint8_t* tones);
 
 #ifdef __cplusplus
 }

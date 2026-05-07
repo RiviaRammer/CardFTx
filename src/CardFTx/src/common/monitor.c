@@ -84,9 +84,8 @@ void monitor_init(monitor_t* me, const monitor_config_t* cfg)
 {
     memset(me, 0, sizeof(*me));
 
-    const ftx_protocol_info_t* protocol = ftx_protocol_info(cfg->protocol);
-    float slot_time = protocol->slot_time;
-    float symbol_period = protocol->symbol_period;
+    float slot_time = (cfg->protocol == FTX_PROTOCOL_FT4) ? FT4_SLOT_TIME : FT8_SLOT_TIME;
+    float symbol_period = (cfg->protocol == FTX_PROTOCOL_FT4) ? FT4_SYMBOL_PERIOD : FT8_SYMBOL_PERIOD;
     // Compute DSP parameters that depend on the sample rate
     me->block_size = (int)(cfg->sample_rate * symbol_period); // samples corresponding to one FSK symbol
     me->subblock_size = me->block_size / cfg->time_osr;
@@ -238,7 +237,7 @@ void monitor_resynth(const monitor_t* me, const candidate_t* candidate, float* s
     const int num_ifft = me->nifft;
     const int num_shift = num_ifft / 2;
     const int taper_width = 4;
-    const int num_tones = ftx_protocol_info(me->wf.protocol)->num_tones;
+    const int num_tones = 8;
 
     // Starting offset is 3 subblocks due to analysis buffer loading
     int offset = 1;                          // candidate->time_offset;
@@ -260,7 +259,7 @@ void monitor_resynth(const monitor_t* me, const candidate_t* candidate, float* s
     for (int num_block = 1; num_block < me->wf.num_blocks; ++num_block)
     {
         // Extract frequency data around the selected candidate only
-        for (int i = candidate->freq_offset - taper_width - 1; i < candidate->freq_offset + num_tones + taper_width - 1; ++i)
+        for (int i = candidate->freq_offset - taper_width - 1; i < candidate->freq_offset + 8 + taper_width - 1; ++i)
         {
             if ((i >= 0) && (i < me->wf.num_bins))
             {

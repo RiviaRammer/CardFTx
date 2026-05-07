@@ -193,18 +193,3 @@ void ft4_encode(const uint8_t* payload, uint8_t* tones)
         }
     }
 }
-
-bool ftx_encode(ftx_protocol_t protocol, const uint8_t* payload, uint8_t* tones)
-{
-    switch (protocol)
-    {
-    case FTX_PROTOCOL_FT8:
-        ft8_encode(payload, tones);
-        return true;
-    case FTX_PROTOCOL_FT4:
-        ft4_encode(payload, tones);
-        return true;
-    default:
-        return false;
-    }
-}
