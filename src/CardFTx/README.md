@@ -30,12 +30,14 @@ Open Serial Monitor at `115200`, or type the same commands on the Cardputer keyb
 - `sync` connects Wi-Fi with the current SSID/PASS and runs NTP sync.
 - `set msg CQ TEST AB12` edits the stored FT8 message and validates it locally.
 - `set freq 1000` sets the FT8 base audio tone in Hz.
-- `tx` encodes the stored message, waits for the next UTC 15 second FT8 boundary, and plays it.
-- `rx` or `rx once` turns off the speaker, enables the built-in microphone, captures one FT8 window at the next UTC 15 second boundary, and decodes it.
+- `tx` queues the stored message for the next UTC 15 second FT8 boundary. After TX, the radio task returns to continuous RX.
+- `rx` or `rx once` is retained as a harmless status command; continuous RX is already running by default.
+- `home` shows the live dashboard.
+- `history` shows recent decoded messages. On the Cardputer keyboard, `/` toggles between home and history.
 - `show` prints the stored message, frequency, Wi-Fi state, and UTC sync state.
 - `help` prints the command list.
 
-The receiver captures a 15 second FT8 window at 12 kHz with `M5Cardputer.Mic` and prints decoded candidates:
+The receiver starts automatically after boot once UTC time is synced. It captures an FT8 window at 12 kHz with `M5Cardputer.Mic` and prints decoded candidates:
 
 ```text
 FT8 +12.5 dB +0.80 s 1000 Hz ~ CQ TEST AB12
@@ -43,4 +45,38 @@ FT8 +12.5 dB +0.80 s 1000 Hz ~ CQ TEST AB12
 
 ## Current Scope
 
-The TX path uses `M5Cardputer.Speaker` and schedules playback on UTC 00/15/30/45 second boundaries after NTP sync. `rx` uses `M5Cardputer.Mic`, so speaker playback and microphone capture are switched rather than used simultaneously.
+The TX path uses `M5Cardputer.Speaker` and schedules playback on UTC 00/15/30/45 second boundaries after NTP sync. RX uses `M5Cardputer.Mic`, so speaker playback and microphone capture are switched rather than used simultaneously.
+
+## Runtime Design
+
+CardFTx now treats RX as the default operating mode. Single-shot RX/TX commands are avoided in the main UI path: the radio task continuously waits for the next FT8 slot, captures RX audio, decodes, and loops. The `tx` command only marks the current stored message as pending for the next slot; the radio task performs the scheduled TX and then goes back to RX.
+
+The task split is intentionally simple:
+
+- Arduino `loop()` remains on the UI side. It calls `M5Cardputer.update()`, reads the keyboard/serial command line, and redraws the screen once per second.
+- `ft8Radio` is pinned to core 0. It owns microphone capture, FT8 decode, scheduled speaker TX, and audio device switching.
+- Shared state is copied through a small critical section. The radio task does not draw to the screen, which keeps UI refresh responsive while RX/TX is running.
+
+## Screen Design
+
+The home screen is a compact dashboard rather than a full waterfall:
+
+```text
+FT8                         RX
+UTC 12:34:08 Odd 07s
+RX -> Decode
+
+TX 1000Hz ready
+CQ BG6WRI ON80
+RX new 2 total 5 AF 1830/214
+>command
+```
+
+- The top-left protocol label is `FT8`; `FT4` is reserved for future support.
+- The top-right mode is `RX` in green or `TX` in red.
+- The second line shows UTC, current slot parity, and countdown to the next 15 second boundary.
+- The third line shows the current action and predicted next action.
+- The TX area shows the stored outgoing message and whether it is queued.
+- The RX area only says whether new messages arrived. Detailed decoded text stays off the home screen.
+
+Press `/` or run `history` to view recent decodes. The history screen shows the newest decoded lines first with audio frequency, estimated SNR, and a shortened message. Opening history clears the unread count. A full waterfall view is not the default because on the Cardputer screen the operating state and recent decode status are more useful during continuous RX; a live waterfall can be added later as a third view if the audio/CPU budget allows it.
