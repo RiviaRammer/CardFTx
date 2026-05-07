@@ -5,6 +5,7 @@
 
 #include <WiFi.h>
 #include <esp_heap_caps.h>
+#include <freertos/semphr.h>
 #include <math.h>
 #include <string.h>
 #include <sys/time.h>
@@ -33,7 +34,6 @@ static constexpr int kSpeakerChunkSamples = 512;
 static constexpr int kSpeakerChannel = 0;
 static constexpr uint32_t kRadioTaskStackBytes = 24 * 1024;
 static constexpr int kFt8BlockSamples = static_cast<int>(kAudioSampleRate * FT8_SYMBOL_PERIOD);
-static constexpr bool kDrawRxWaterfall = false;
 static constexpr uint8_t kDisplayTextSize = 2;
 static constexpr uint8_t kDisplaySmallTextSize = 1;
 static constexpr int kDisplayLineHeight = 18;
@@ -41,6 +41,7 @@ static constexpr int kCommandMaxLength = 63;
 static constexpr float kFt8SymbolBt = 2.0f;
 static constexpr float kGfskConstK = 5.336446f;
 static constexpr int kDecodeHistorySize = 8;
+static constexpr uint8_t kHidKeyEscape = 0x29;
 
 enum class RadioPhase : uint8_t {
     Boot,
@@ -55,7 +56,8 @@ enum class RadioPhase : uint8_t {
 
 enum class UiView : uint8_t {
     Home,
-    History
+    History,
+    Waterfall
 };
 
 struct DecodeHistoryItem {
@@ -67,6 +69,7 @@ struct DecodeHistoryItem {
 };
 
 static TaskHandle_t radioTaskHandle;
+static SemaphoreHandle_t displayMutex;
 static portMUX_TYPE appStateMux = portMUX_INITIALIZER_UNLOCKED;
 static char txMessage[FTX_MAX_MESSAGE_LENGTH] = "CQ BG6WRI ON80";
 static float txToneHz = kFt8DefaultToneHz;
@@ -75,6 +78,7 @@ static uint8_t speakerBufferIndex = 0;
 static bool isTransmitting = false;
 static bool isReceiving = false;
 static bool txRequested = false;
+static bool txCancelRequested = false;
 static RadioPhase radioPhase = RadioPhase::Boot;
 static UiView uiView = UiView::Home;
 static int latestRxDecodedCount = 0;
@@ -85,6 +89,7 @@ static DecodeHistoryItem decodeHistory[kDecodeHistorySize];
 static int decodeHistoryCount = 0;
 static uint32_t lastDisplayMs = 0;
 static uint32_t displayHoldUntilMs = 0;
+static bool waterfallFrameDrawn = false;
 static String keyboardCommand;
 static int16_t rxPcm[kFt8BlockSamples];
 static float rxFrame[kFt8BlockSamples];
@@ -317,13 +322,24 @@ static void setUiView(UiView view)
     portEXIT_CRITICAL(&appStateMux);
     displayHoldUntilMs = 0;
     lastDisplayMs = 0;
+    waterfallFrameDrawn = false;
 }
 
 static void toggleUiView()
 {
     UiView view;
     portENTER_CRITICAL(&appStateMux);
-    view = uiView == UiView::Home ? UiView::History : UiView::Home;
+    switch (uiView) {
+    case UiView::Home:
+        view = UiView::History;
+        break;
+    case UiView::History:
+        view = UiView::Waterfall;
+        break;
+    default:
+        view = UiView::Home;
+        break;
+    }
     uiView = view;
     if (view == UiView::History) {
         unreadDecodedCount = 0;
@@ -331,9 +347,83 @@ static void toggleUiView()
     portEXIT_CRITICAL(&appStateMux);
     displayHoldUntilMs = 0;
     lastDisplayMs = 0;
+    waterfallFrameDrawn = false;
 }
 
-static void renderCommandLine()
+static void renderStatus(bool force);
+
+static bool isUiView(UiView view)
+{
+    bool matches;
+    portENTER_CRITICAL(&appStateMux);
+    matches = uiView == view;
+    portEXIT_CRITICAL(&appStateMux);
+    return matches;
+}
+
+static bool isTxCancelRequested()
+{
+    bool cancel;
+    portENTER_CRITICAL(&appStateMux);
+    cancel = txCancelRequested;
+    portEXIT_CRITICAL(&appStateMux);
+    return cancel;
+}
+
+static bool isWaterfallCaptureVisible()
+{
+    bool visible;
+    portENTER_CRITICAL(&appStateMux);
+    visible = uiView == UiView::Waterfall && radioPhase == RadioPhase::RxCapture;
+    portEXIT_CRITICAL(&appStateMux);
+    return visible;
+}
+
+static void clearTxCancelRequest()
+{
+    portENTER_CRITICAL(&appStateMux);
+    txCancelRequested = false;
+    portEXIT_CRITICAL(&appStateMux);
+}
+
+static void requestTxCancel()
+{
+    bool wasPending;
+    bool wasTransmitting;
+    portENTER_CRITICAL(&appStateMux);
+    wasPending = txRequested;
+    wasTransmitting = radioPhase == RadioPhase::WaitTxSlot || radioPhase == RadioPhase::TxTransmit;
+    txRequested = false;
+    txCancelRequested = true;
+    portEXIT_CRITICAL(&appStateMux);
+
+    if (wasPending || wasTransmitting) {
+        M5Cardputer.Speaker.stop();
+        if (radioTaskHandle != nullptr) {
+            xTaskNotifyGive(radioTaskHandle);
+        }
+        Serial.println("TX cancelled");
+    } else {
+        Serial.println("No TX to cancel");
+    }
+    renderStatus(true);
+}
+
+static void lockDisplay()
+{
+    if (displayMutex != nullptr) {
+        xSemaphoreTake(displayMutex, portMAX_DELAY);
+    }
+}
+
+static void unlockDisplay()
+{
+    if (displayMutex != nullptr) {
+        xSemaphoreGive(displayMutex);
+    }
+}
+
+static void renderCommandLineUnlocked()
 {
     auto& display = M5Cardputer.Display;
     int y = static_cast<int>(display.height()) - 17;
@@ -351,6 +441,13 @@ static void renderCommandLine()
     display.setTextColor(TFT_WHITE, TFT_BLACK);
     display.setCursor(4, y);
     display.printf("%s", text.c_str());
+}
+
+static void renderCommandLine()
+{
+    lockDisplay();
+    renderCommandLineUnlocked();
+    unlockDisplay();
 }
 
 static void renderStatus(bool force = false)
@@ -394,6 +491,7 @@ static void renderStatus(bool force = false)
     const bool txMode = phase == RadioPhase::WaitTxSlot || phase == RadioPhase::TxTransmit;
     const bool rxMode = phase == RadioPhase::WaitRxSlot || phase == RadioPhase::RxCapture || phase == RadioPhase::RxDecode;
     const char* statusText = txMode ? "TX" : (rxMode ? "RX" : "--");
+    lockDisplay();
     int screenW = M5Cardputer.Display.width();
     int statusX = screenW - static_cast<int>(strlen(statusText)) * 12 - 4;
 
@@ -437,6 +535,21 @@ static void renderStatus(bool force = false)
             M5Cardputer.Display.setTextColor(TFT_DARKGREY, TFT_BLACK);
             M5Cardputer.Display.printf("No RX history");
         }
+    } else if (view == UiView::Waterfall) {
+        M5Cardputer.Display.setTextSize(kDisplayTextSize);
+        M5Cardputer.Display.setTextColor(TFT_CYAN, TFT_BLACK);
+        M5Cardputer.Display.setCursor(4, 64);
+        M5Cardputer.Display.printf("Waterfall");
+        M5Cardputer.Display.setTextSize(kDisplaySmallTextSize);
+        M5Cardputer.Display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        M5Cardputer.Display.setCursor(4, 88);
+        if (phase == RadioPhase::RxCapture) {
+            M5Cardputer.Display.printf("RX capture starting");
+        } else {
+            M5Cardputer.Display.printf("Shows during RX capture");
+        }
+        M5Cardputer.Display.setCursor(4, 102);
+        M5Cardputer.Display.printf("AF %ld/%lu", static_cast<long>(peak), static_cast<unsigned long>(avgAbs));
     } else {
         M5Cardputer.Display.setTextSize(kDisplayTextSize);
         M5Cardputer.Display.setTextColor(TFT_WHITE, TFT_BLACK);
@@ -460,7 +573,8 @@ static void renderStatus(bool force = false)
                 static_cast<unsigned long>(avgAbs));
         }
     }
-    renderCommandLine();
+    renderCommandLineUnlocked();
+    unlockDisplay();
 }
 
 static void returnHomeForCommandInput()
@@ -505,10 +619,11 @@ static uint16_t waterfallColor(uint8_t mag)
 
 static void renderRxWaterfall(const monitor_t& monitor)
 {
-    if (!kDrawRxWaterfall || monitor.wf.num_blocks == 0 || monitor.wf.mag == nullptr) {
+    if (monitor.wf.num_blocks == 0 || monitor.wf.mag == nullptr) {
         return;
     }
 
+    lockDisplay();
     auto& display = M5Cardputer.Display;
     int screenW = display.width();
     int screenH = display.height();
@@ -519,7 +634,7 @@ static void renderRxWaterfall(const monitor_t& monitor)
     const int plotW = max(1, right - left + 1);
     const int plotH = max(1, bottom - top + 1);
 
-    if (monitor.wf.num_blocks == 1) {
+    if (!waterfallFrameDrawn || monitor.wf.num_blocks == 1) {
         display.fillRect(0, 0, screenW, screenH, TFT_BLACK);
         display.drawRect(left - 1, top - 1, plotW + 2, plotH + 2, TFT_DARKGREY);
         for (int x = 1; x < 4; ++x) {
@@ -532,6 +647,7 @@ static void renderRxWaterfall(const monitor_t& monitor)
         display.printf("%dHz", static_cast<int>(monitor.min_bin / monitor.symbol_period));
         display.setCursor(screenW - 43, bottom + 4);
         display.printf("%dHz", static_cast<int>((monitor.max_bin - 1) / monitor.symbol_period));
+        waterfallFrameDrawn = true;
     }
 
     display.fillRect(0, 0, screenW, top - 1, TFT_BLACK);
@@ -592,7 +708,8 @@ static void renderRxWaterfall(const monitor_t& monitor)
         normalized = normalized < 0 ? 0 : (normalized > 255 ? 255 : normalized);
         display.fillRect(left + x, y0, 1, rowH, waterfallColor(static_cast<uint8_t>(normalized)));
     }
-    renderCommandLine();
+    renderCommandLineUnlocked();
+    unlockDisplay();
 }
 
 static bool connectWifi(const char* ssid, const char* password, uint32_t timeoutMs = 15000)
@@ -676,6 +793,9 @@ static bool waitForFt8Slot(bool abortOnTxRequest = false)
         int64_t remainingUs = (static_cast<int64_t>(target - tv.tv_sec) * 1000000LL) - tv.tv_usec;
         if (remainingUs <= 0) {
             break;
+        }
+        if (!abortOnTxRequest && isTxCancelRequested()) {
+            return false;
         }
         if (abortOnTxRequest) {
             bool pendingTx;
@@ -923,6 +1043,9 @@ static bool receiveOnce()
         rxSampleTotal += monitor.block_size;
 
         monitor_process(&monitor, rxFrame);
+        if (isUiView(UiView::Waterfall)) {
+            renderRxWaterfall(monitor);
+        }
         if ((monitor.wf.num_blocks % 10) == 0) {
             Serial.print(".");
         }
@@ -1008,16 +1131,20 @@ static void speakerPlayChunk(const int16_t* samples, int sampleCount, bool stopC
     M5Cardputer.Speaker.playRaw(target, sampleCount, kAudioSampleRate, false, 1, kSpeakerChannel, stopCurrent);
 }
 
-static void writeSilenceSamples(int sampleCount)
+static bool writeSilenceSamples(int sampleCount, bool abortOnTxCancel = false)
 {
     int16_t silence[kSpeakerChunkSamples] = {};
     bool first = false;
     while (sampleCount > 0) {
+        if (abortOnTxCancel && isTxCancelRequested()) {
+            return false;
+        }
         int count = min(sampleCount, kSpeakerChunkSamples);
         speakerPlayChunk(silence, count, first);
         first = false;
         sampleCount -= count;
     }
+    return true;
 }
 
 static void playTestTone(float frequencyHz, int durationMs)
@@ -1079,19 +1206,38 @@ static bool transmitFt8(const char* text, float baseToneHz, bool waitForSlot)
     setRadioPhase(waitForSlot ? RadioPhase::WaitTxSlot : RadioPhase::TxTransmit);
 
     if (waitForSlot && !waitForFt8Slot()) {
-        setRadioPhase(RadioPhase::WaitSync);
+        if (isTxCancelRequested()) {
+            Serial.println("TX cancelled before slot");
+            clearTxCancelRequest();
+            setRadioPhase(RadioPhase::WaitRxSlot);
+        } else {
+            setRadioPhase(RadioPhase::WaitSync);
+        }
         return false;
     }
 
     setRadioPhase(RadioPhase::TxTransmit);
     Serial.printf("TX audio at %.1f Hz\n", baseToneHz);
     M5Cardputer.Speaker.stop();
-    writeSilenceSamples(silenceSamples);
+    if (!writeSilenceSamples(silenceSamples, true)) {
+        M5Cardputer.Speaker.stop();
+        M5Cardputer.Speaker.end();
+        clearTxCancelRequest();
+        setRadioPhase(RadioPhase::WaitRxSlot);
+        return false;
+    }
 
     int16_t chunk[kSpeakerChunkSamples];
     float phase = 0.0f;
     int sampleIndex = 0;
     while (sampleIndex < waveSamples) {
+        if (isTxCancelRequested()) {
+            M5Cardputer.Speaker.stop();
+            M5Cardputer.Speaker.end();
+            clearTxCancelRequest();
+            setRadioPhase(RadioPhase::WaitRxSlot);
+            return false;
+        }
         int count = min(kSpeakerChunkSamples, waveSamples - sampleIndex);
         for (int i = 0; i < count; ++i) {
             chunk[i] = synthSample(tones, sampleIndex + i, baseToneHz, phase);
@@ -1101,12 +1247,26 @@ static bool transmitFt8(const char* text, float baseToneHz, bool waitForSlot)
         sampleIndex += count;
     }
 
-    writeSilenceSamples(silenceSamples);
+    if (!writeSilenceSamples(silenceSamples, true)) {
+        M5Cardputer.Speaker.stop();
+        M5Cardputer.Speaker.end();
+        clearTxCancelRequest();
+        setRadioPhase(RadioPhase::WaitRxSlot);
+        return false;
+    }
     while (M5Cardputer.Speaker.isPlaying(kSpeakerChannel)) {
+        if (isTxCancelRequested()) {
+            M5Cardputer.Speaker.stop();
+            M5Cardputer.Speaker.end();
+            clearTxCancelRequest();
+            setRadioPhase(RadioPhase::WaitRxSlot);
+            return false;
+        }
         delay(1);
     }
     Serial.println("TX done");
     M5Cardputer.Speaker.end();
+    clearTxCancelRequest();
     setRadioPhase(RadioPhase::WaitRxSlot);
     return true;
 }
@@ -1144,6 +1304,11 @@ static String readSerialLine()
         if (ch == '\r') {
             continue;
         }
+        if (ch == 27) {
+            line = "";
+            requestTxCancel();
+            continue;
+        }
         returnHomeForCommandInput();
         if (ch == '\n') {
             String out = line;
@@ -1163,6 +1328,26 @@ static String readKeyboardLine()
     }
 
     Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
+    bool escapePressed = false;
+    for (uint8_t hid : status.hid_keys) {
+        if (hid == kHidKeyEscape) {
+            escapePressed = true;
+            break;
+        }
+    }
+    for (char ch : status.word) {
+        if (ch == 27 || (status.fn && ch == '`')) {
+            escapePressed = true;
+            break;
+        }
+    }
+    if (escapePressed) {
+        keyboardCommand = "";
+        requestTxCancel();
+        renderCommandLine();
+        return String();
+    }
+
     bool changed = false;
     if (keyboardCommand.length() == 0) {
         for (char ch : status.word) {
@@ -1223,15 +1408,17 @@ static void printCommandHelp()
     Serial.println("  set PASS your_wifi_password");
     Serial.println("  sync");
     Serial.println("  tx");
-    Serial.println("  home | history");
+    Serial.println("  esc cancels queued/current TX");
+    Serial.println("  home | history | waterfall");
     Serial.println("  show");
-    Serial.println("  / toggles home/history on the keyboard");
+    Serial.println("  / cycles home/history/waterfall on the keyboard");
 }
 
 static void requestTxNextSlot()
 {
     portENTER_CRITICAL(&appStateMux);
     txRequested = true;
+    txCancelRequested = false;
     portEXIT_CRITICAL(&appStateMux);
     if (radioTaskHandle != nullptr) {
         xTaskNotifyGive(radioTaskHandle);
@@ -1339,6 +1526,8 @@ static void handleCommand(const String& input)
         requestTxNextSlot();
         Serial.println("TX queued for the next FT8 slot");
         renderStatus(true);
+    } else if (lower == "esc" || lower == "cancel" || lower == "stop") {
+        requestTxCancel();
     } else if (lower == "rx" || lower == "rx once") {
         Serial.println("Continuous RX is already running");
     } else if (lower == "home") {
@@ -1346,6 +1535,9 @@ static void handleCommand(const String& input)
         renderStatus(true);
     } else if (lower == "history" || lower == "hist") {
         setUiView(UiView::History);
+        renderStatus(true);
+    } else if (lower == "waterfall" || lower == "wf") {
+        setUiView(UiView::Waterfall);
         renderStatus(true);
     } else {
         Serial.println("Unknown command. Type: help");
@@ -1364,6 +1556,13 @@ bool ft8AppBegin()
     wifiSsid[sizeof(wifiSsid) - 1] = '\0';
     strncpy(wifiPassword, kDefaultWifiPassword, sizeof(wifiPassword) - 1);
     wifiPassword[sizeof(wifiPassword) - 1] = '\0';
+
+    displayMutex = xSemaphoreCreateMutex();
+    if (displayMutex == nullptr) {
+        Serial.println("display mutex allocation failed");
+        setRadioPhase(RadioPhase::Error);
+        return false;
+    }
 
     hashtableInit();
     renderStatus(true);
@@ -1398,7 +1597,9 @@ void ft8AppLoop()
         line = readKeyboardLine();
     }
     if (line.length() == 0) {
-        renderStatus();
+        if (!isWaterfallCaptureVisible()) {
+            renderStatus();
+        }
         delay(10);
         return;
     }

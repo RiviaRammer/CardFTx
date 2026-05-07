@@ -5,7 +5,7 @@ A FT4/FT8 client on Cardputer.
 
 ## Installation
 
-- **Board:** M5Stack  
+- **Board:** M5Stack (3.2.6, mic is disable on 3.3.7)  
 - **Libraries:** M5Cardputer (and all required dependencies)
 
 ## Setting

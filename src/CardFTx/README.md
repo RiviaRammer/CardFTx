@@ -31,9 +31,12 @@ Open Serial Monitor at `115200`, or type the same commands on the Cardputer keyb
 - `set msg CQ TEST AB12` edits the stored FT8 message and validates it locally.
 - `set freq 1000` sets the FT8 base audio tone in Hz.
 - `tx` queues the stored message for the next UTC 15 second FT8 boundary. After TX, the radio task returns to continuous RX.
+- `esc`, `cancel`, or `stop` cancels queued TX or stops the current TX.
 - `rx` or `rx once` is retained as a harmless status command; continuous RX is already running by default.
 - `home` shows the live dashboard.
-- `history` shows recent decoded messages. On the Cardputer keyboard, `/` toggles between home and history.
+- `history` shows recent decoded messages.
+- `waterfall` or `wf` shows the live RX waterfall during capture.
+- On the Cardputer keyboard, `/` cycles through home, history, and waterfall. ESC cancels queued/current TX.
 - `show` prints the stored message, frequency, Wi-Fi state, and UTC sync state.
 - `help` prints the command list.
 
@@ -55,7 +58,7 @@ The task split is intentionally simple:
 
 - Arduino `loop()` remains on the UI side. It calls `M5Cardputer.update()`, reads the keyboard/serial command line, and redraws the screen once per second.
 - `ft8Radio` is pinned to core 0. It owns microphone capture, FT8 decode, scheduled speaker TX, and audio device switching.
-- Shared state is copied through a small critical section. The radio task does not draw to the screen, which keeps UI refresh responsive while RX/TX is running.
+- Shared state is copied through a small critical section. The radio task only draws directly while the waterfall view is visible during RX capture.
 
 ## Screen Design
 
@@ -79,4 +82,4 @@ RX new 2 total 5 AF 1830/214
 - The TX area shows the stored outgoing message and whether it is queued.
 - The RX area only says whether new messages arrived. Detailed decoded text stays off the home screen.
 
-Press `/` or run `history` to view recent decodes. The history screen shows the newest decoded lines first with audio frequency, estimated SNR, and a shortened message. Opening history clears the unread count. A full waterfall view is not the default because on the Cardputer screen the operating state and recent decode status are more useful during continuous RX; a live waterfall can be added later as a third view if the audio/CPU budget allows it.
+Press `/` to cycle Home -> History -> Waterfall. The history screen shows the newest decoded lines first with audio frequency, estimated SNR, and a shortened message. Opening history clears the unread count. The waterfall screen draws the live RX waterfall while a capture is in progress and otherwise shows a waiting/status panel.
