@@ -1,7 +1,7 @@
 # CardFTx
 A FT4/FT8 codec on Cardputer.
 ![示例](images/spectrum.png)
-![示例](images/screen.png)
+![示例](images/screen.jpeg)
 
 ## Installation
 
